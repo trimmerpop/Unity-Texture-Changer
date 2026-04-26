@@ -15,21 +15,10 @@ from PIL import Image
 from asset_manager import AssetManager
 from similarity import get_image_hash, hamming_similarity, compare_images, load_image
 from comparison_widget import ComparisonWidget
-import ctypes # For Windows taskbar icon fix
 import cv2
 import time
 from packaging import version
-
-def set_app_user_model_id():
-    """
-    Sets the Application User Model ID for the current process.
-    This helps Windows 7+ to correctly group taskbar icons.
-    """
-    if sys.platform == "win32":
-        # Arbitrary unique string for your application
-        my_app_id = u"UnityTextureChanger.App" 
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(my_app_id)
-
+import ctypes
 
 class SortableTreeWidgetItem(QTreeWidgetItem):
     def natural_key(self, text):
@@ -376,7 +365,6 @@ class WorkerThread(QThread):
                             # Copy the modified image to overwrite the original extracted image
                             if res.get('match_file'):
                                 shutil.copy2(res['match_file'], res['original']['save_path'])
-                                res['best_similarity'] = 1.0
                         except Exception as e:
                             self.sig_log.emit(f"Sync failed for {res['original']['name']}: {e}")
                 processed_count += len(replacements)
@@ -386,6 +374,7 @@ class WorkerThread(QThread):
             self.sig_log.emit(f"Processing direct file copies for {total_direct} items...")
             for i, res in enumerate(direct_files):
                 o = res['original']
+                bm = res['best_match']
                 
                 # SAFETY CHECK: If save_path is in temp folder, this is likely WRONG
                 if temp_orig in os.path.abspath(o['save_path']):
@@ -397,7 +386,6 @@ class WorkerThread(QThread):
                 try:
                     shutil.copy2(res['match_file'], o['save_path'])
                     count += 1
-                    res['best_similarity'] = 1.0
                 except Exception as e:
                     self.sig_log.emit(f"Failed to overwrite {o['save_path']}: {e}")
                 processed_count += 1
@@ -476,15 +464,13 @@ class WorkerThread(QThread):
 
                 except Exception as e:
                     self.sig_log.emit(f"EXCEPTION during repacking: {e}")
-        
+        # 5. Finalize
         self.sig_progress.emit(100, "Apply complete.")
-        self.sig_finished.emit({"success": count, "total": total})
+        self.sig_finished.emit({"success": count, "total": total, "successful_paths": [r['original']['save_path'] for r in to_replace]})
 
     def run_copy(self):
         to_replace = self.args['to_replace']
         target_dir = self.args['target_dir']
-        orig_dir = self.args.get('orig_dir')
-        mode = self.args.get('mode')
         
         count = 0
         total = len(to_replace)
@@ -493,41 +479,27 @@ class WorkerThread(QThread):
             src = res['match_file']
             if not src: continue
             
-            orig = res['original']
+            # Filename Logic
             ext = os.path.splitext(src)[1]
-
-            if mode == "Image" and orig_dir:
-                # Preserve directory structure for Image mode
-                try:
-                    rel_path = os.path.relpath(orig['save_path'], orig_dir)
-                    # Ensure extension matches the match_file
-                    rel_path_no_ext = os.path.splitext(rel_path)[0]
-                    dst_name = rel_path_no_ext + ext
-                    dst = os.path.join(target_dir, dst_name)
-                except ValueError:
-                    dst_name = orig['name'] + ext
-                    dst = os.path.join(target_dir, dst_name)
+            if self.args.get('use_uabea_format'):
+                orig = res['original']
+                assets_name = os.path.basename(orig.get('source_asset', 'Unknown'))
+                path_id = orig.get('path_id', '0')
+                dst_name = f"{orig['name']}-{assets_name}-{path_id}{ext}"
             else:
-                # Flat export for Unity/Other modes
-                if self.args.get('use_uabea_format'):
-                    assets_name = os.path.basename(orig.get('source_asset', 'Unknown'))
-                    path_id = orig.get('path_id', '0')
-                    dst_name = f"{orig['name']}-{assets_name}-{path_id}{ext}"
-                else:
-                    dst_name = orig['name'] + ext
-                dst = os.path.join(target_dir, dst_name)
-
+                dst_name = res['original']['name'] + ext
+                
+            dst = os.path.join(target_dir, dst_name)
             self.sig_progress.emit(int((i/total)*100), f"Copying {i+1}/{total}: {dst_name}")
             
             try:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.copy2(src, dst)
                 count += 1
             except Exception as e:
                 self.sig_log.emit(f"Failed to copy {src}: {e}")
         
         self.sig_progress.emit(100, "Copy complete.")
-        self.sig_finished.emit({"success": count, "total": total, "target_dir": target_dir})
+        self.sig_finished.emit({"success": count, "total": total, "target_dir": target_dir, "successful_paths": [r['original']['save_path'] for r in to_replace]})
 
     def run_extract(self):
         orig_dir = self.args['orig_dir']
@@ -634,7 +606,7 @@ class WorkerThread(QThread):
                 prog = prog_start + int(pct * (prog_range / 100))
                 self.sig_progress.emit(prog, f"Extracting {label}: {text}")
             
-            textures = am.extract_textures(current_target_dir, temp_path, progress_callback=progress_cb, log_callback=self.sig_log.emit, scan_all=scan_all)
+            textures = am.extract_textures(current_target_dir, temp_path, progress_callback=progress_cb, scan_all=scan_all)
             # Ensure save_path and size are present
             for t in textures:
                 if 'file' in t and 'save_path' not in t:
@@ -915,11 +887,15 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Unity Texture Changer")
+        self.setWindowTitle("Unity Texture Changer (v2.0)")
+        
+        # Set Window Icon
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+            
         self.resize(1280, 800)
         self.results = []
-        self.orig_textures = []
-        self.mod_textures = []
         self.worker_thread = None
         self.current_preview_id = 0
         
@@ -930,24 +906,8 @@ class MainWindow(QMainWindow):
         self.sig_request_preview.connect(self.preview_worker.run_preview)
         self.preview_worker.sig_preview_ready.connect(self.on_preview_ready)
         self.preview_thread.start()
-
-        # Ensure temp folders are always relative to the executable/script location
-        # Asset/Bundled files are in _MEIPASS when frozen
-        if getattr(sys, 'frozen', False):
-            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-            bundle_dir = getattr(sys, '_MEIPASS', exe_dir)
-        else:
-            exe_dir = os.path.dirname(os.path.abspath(__file__))
-            bundle_dir = exe_dir
-
-        self.temp_dir_orig = os.path.join(exe_dir, "temp_original")
-        self.temp_dir_mod = os.path.join(exe_dir, "temp_modified")
-        
-        # Set Window Icon
-        icon_path = os.path.join(bundle_dir, "app_icon.ico")
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
-            
+        self.temp_dir_orig = os.path.abspath("temp_original")
+        self.temp_dir_mod = os.path.abspath("temp_modified")
         self.start_time = None
         self.current_orig_img = None
         self.current_pix = None
@@ -956,6 +916,20 @@ class MainWindow(QMainWindow):
         self._is_deleting = False
         self.init_ui()
         self.load_settings()
+
+    def closeEvent(self, event):
+        """Save metadata and settings on exit."""
+        try:
+            self._sync_metadata_to_disk()
+            # Save some UI settings if needed
+            settings = QSettings("config.ini", QSettings.Format.IniFormat)
+            settings.setValue("options/mode", self.mode_combo.currentText())
+            settings.setValue("options/high_quality", self.chk_high_quality.isChecked())
+            settings.sync()
+            self.log("Metadata and settings saved on exit.")
+        except Exception as e:
+            print(f"Error during close: {e}")
+        event.accept()
 
     def _normalize_textures(self, textures, temp_path):
         """Ensures all textures have required fields like 'save_path' and 'size'."""
@@ -1063,7 +1037,7 @@ class MainWindow(QMainWindow):
             self.txt_sim_cutoff.setText(str(settings.value("options/sim_cutoff", "0.5")))
             self.txt_sim_cutoff.setEnabled(sim_filter)
             
-            self.num_candidates.setText(str(settings.value("options/num_candidates", "15")))
+            self.num_candidates.setText(str(settings.value("options/num_candidates", "5")))
             
             highlight_diff = get_bool_val("options/highlight_diff", "true")
             self.diff_check.setChecked(highlight_diff)
@@ -1148,7 +1122,7 @@ class MainWindow(QMainWindow):
 
         opt_row1.addSpacing(10)
         opt_row1.addWidget(QLabel("Max Candidates:"))
-        self.num_candidates = QLineEdit("5")
+        self.num_candidates = QLineEdit("15")
         self.num_candidates.setFixedWidth(40)
         opt_row1.addWidget(self.num_candidates)
 
@@ -1187,6 +1161,7 @@ class MainWindow(QMainWindow):
         self.btn_extract.clicked.connect(self.extract)
         opt_row2.addWidget(self.btn_extract)
         
+        opt_row2.addSpacing(10)
         self.btn_match = QPushButton("Match")
         self.btn_match.clicked.connect(self.match)
         opt_row2.addWidget(self.btn_match)
@@ -1205,6 +1180,7 @@ class MainWindow(QMainWindow):
         self.chk_high_quality = QCheckBox("High Quality (BC7)")
         self.chk_high_quality.setToolTip("Force high quality BC7 compression to fix banding")
         self.chk_high_quality.setChecked(False)
+        self.chk_high_quality.setVisible(False)
         opt_row2.addWidget(self.chk_high_quality)
 
         opt_row2.addSpacing(10)
@@ -1268,7 +1244,6 @@ class MainWindow(QMainWindow):
         self.tree.sig_check_all.connect(self.check_all_items)
         self.tree.sig_inverse_all.connect(self.inverse_all_items)
         self.tree.setSortingEnabled(True)
-        self.tree.header().setSortIndicator(1, Qt.SortOrder.AscendingOrder)
         tree_area.addWidget(self.tree)
         
         # Progress Bar moved below tree
@@ -1375,10 +1350,10 @@ class MainWindow(QMainWindow):
 
     def has_images(self, path):
         if not path or not os.path.isdir(path): return False
-        path = os.path.normpath(path.strip())
+        path = os.path.normpath(path)
         try:
             for root, dirs, fnames in os.walk(path):
-                if any(f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif')) for f in fnames):
+                if any(f.lower().endswith(('.png', '.jpg', '.jpeg')) for f in fnames):
                     return True
                 # No limit on depth, search everything
         except: pass
@@ -1456,13 +1431,12 @@ class MainWindow(QMainWindow):
     def on_path_changed(self, _):
         # Auto-detect mode and clear temp if path changed
         sender = self.sender()
-        path = sender.text().strip() if sender else ""
+        path = sender.text() if sender else ""
         
         # Only check if it's a valid directory to prevent constant clearing while typing
         if path and os.path.exists(path):
             is_loading = getattr(self, '_is_loading', False)
             if sender == self.orig_path:
-                self.orig_textures = []
                 if not self.is_extracted(path, self.temp_dir_orig):
                     if not is_loading:
                         self.check_and_clear_temp(self.temp_dir_orig)
@@ -1470,7 +1444,6 @@ class MainWindow(QMainWindow):
                         self.tree.clear()
                         self.update_status_counts()
             elif sender == self.mod_path:
-                self.mod_textures = []
                 if not self.is_extracted(path, self.temp_dir_mod):
                     if not is_loading:
                         self.check_and_clear_temp(self.temp_dir_mod)
@@ -1546,18 +1519,50 @@ class MainWindow(QMainWindow):
         self.update_buttons()
 
     def on_apply_finished(self, summary):
-        self.update_tree(show_progress=False)
-        self._sync_metadata_to_disk()
         self.update_buttons(is_finishing=True)
+        if 'successful_paths' in summary:
+            self._mark_items_as_replaced(summary['successful_paths'])
+        self._sync_metadata_to_disk()
         self.log(f"Apply finished: {summary}")
         QMessageBox.information(self, "Finished", f"Successfully applied {summary['success']} textures.")
 
+    def _mark_items_as_replaced(self, successful_paths):
+        """Updates internal results and UI tree after successful replacement."""
+        if not successful_paths: return
+        paths_set = set(successful_paths)
+        changed = False
+        
+        # 1. Update self.results
+        for res in self.results:
+            if res['original']['save_path'] in paths_set:
+                res['best_similarity'] = 1.0
+                res['replace'] = False # Uncheck after success
+                # Update candidates similarity too if match_file is found
+                for cand in res.get('candidates', []):
+                    if cand['save_path'] == res.get('match_file'):
+                        cand['similarity'] = 1.0
+                changed = True
+        
+        if changed:
+            # 2. Update UI Tree
+            self.tree.blockSignals(True)
+            for i in range(self.tree.topLevelItemCount()):
+                item = self.tree.topLevelItem(i)
+                res = item.data(1, Qt.ItemDataRole.UserRole)
+                if res['original']['save_path'] in paths_set:
+                    # Update similarity text (Column 4)
+                    item.setText(4, "100.0%")
+                    # Uncheck
+                    item.setCheckState(0, Qt.CheckState.Unchecked)
+                    item.setData(0, Qt.ItemDataRole.UserRole, False)
+            self.tree.blockSignals(False)
+            
+            self.update_status_counts()
+            self.update_copy_button_state()
+            self.tree.viewport().update()
+
     def on_mode_changed(self, mode):
         # Enable Packer only for Unity mode
-        self.orig_textures = []
-        self.mod_textures = []
-        self.results = []
-        self.tree.clear()
         self.update_buttons()
         self.log(f"Switched to {mode} mode.")
 
@@ -1618,6 +1623,7 @@ class MainWindow(QMainWindow):
             if isinstance(first, dict) and 'original' in first and 'candidates' in first:
                 self.results = loaded_metadata
                 self.update_tree()
+                # Sort by Name (Column 1) Ascending by default
                 self.tree.sortByColumn(1, Qt.SortOrder.AscendingOrder)
                 self.log("Restored previous matching results and checkbox states from metadata.json.")
                 # Reset progress bar once restoration and tree building are complete
@@ -1634,19 +1640,16 @@ class MainWindow(QMainWindow):
     def match(self):
         # Fallback: If in Image mode and textures are missing, scan folders directly
         is_image_mode = self.mode_combo.currentText() == "Image"
-        orig_dir = self.orig_path.text().strip()
-        mod_dir = self.mod_path.text().strip()
         
-        if is_image_mode:
-            # Always fresh scan for Image mode to reflect filesystem changes
-            self.orig_textures = self.scan_image_folder(orig_dir)
-            self.mod_textures = self.scan_image_folder(mod_dir)
-        else:
-            # For Unity/APK, prioritize memory then disk metadata
-            if not self.orig_textures:
-                self.orig_textures = self.get_asset_manager().load_metadata(self.temp_dir_orig) or []
-            if not self.mod_textures:
-                self.mod_textures = self.get_asset_manager().load_metadata(self.temp_dir_mod) or []
+        if not hasattr(self, 'orig_textures') or not self.orig_textures:
+            self.orig_textures = self.get_asset_manager().load_metadata(self.temp_dir_orig) or []
+            if not self.orig_textures and is_image_mode:
+                self.orig_textures = self.scan_image_folder(self.orig_path.text())
+                
+        if not hasattr(self, 'mod_textures') or not self.mod_textures:
+            self.mod_textures = self.get_asset_manager().load_metadata(self.temp_dir_mod) or []
+            if not self.mod_textures and is_image_mode:
+                self.mod_textures = self.scan_image_folder(self.mod_path.text())
             
         if not self.orig_textures or not self.mod_textures:
             msg = "Extraction metadata missing. Please Extract first."
@@ -1670,12 +1673,12 @@ class MainWindow(QMainWindow):
 
     def scan_image_folder(self, folder):
         textures = []
-        if not folder or not os.path.exists(folder.strip()): return textures
-        folder = os.path.normpath(folder.strip())
+        if not os.path.exists(folder): return textures
+        folder = os.path.normpath(folder)
         self.log(f"Scanning images in {folder} (including all subfolders)...")
         for root, dirs, fnames in os.walk(folder):
             for f in fnames:
-                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif')):
+                if f.lower().endswith(('.png', '.jpg', '.jpeg')):
                     path = os.path.join(root, f)
                     try:
                         img = Image.open(path)
@@ -1725,10 +1728,7 @@ class MainWindow(QMainWindow):
         self.update_buttons(is_finishing=True)
         self.btn_match.setEnabled(False) # Disable match after it finishes
         self.log(f"Matching finished. Found matches for {len(results)} textures.")
-        am = self.get_asset_manager()
-        # Strip hashes before saving to metadata.json
-        clean_results = self._strip_metadata(self.results)
-        am.save_metadata(clean_results, self.temp_dir_orig)
+        self._sync_metadata_to_disk()
         self.update_buttons()
         
         # User: "Match가 끝난 뒤에 'Name' 오른차순으로 되게해줘."
@@ -2029,7 +2029,8 @@ class MainWindow(QMainWindow):
             res = item.data(1, Qt.ItemDataRole.UserRole)
             idx = item.data(2, Qt.ItemDataRole.UserRole)
             
-            if res.get('replace', False):
+            # If either UI is checked OR data says replace is True, we must uncheck
+            if item.checkState(0) == Qt.CheckState.Checked or res.get('replace', False):
                 if idx is not None and idx < len(self.results):
                     self.results[idx]['replace'] = False
                 
@@ -2042,9 +2043,10 @@ class MainWindow(QMainWindow):
             self.update_buttons()
             self.update_status_counts()
             self.update_copy_button_state()
+            self.tree.viewport().update()
             if self.tree.sortColumn() == 0:
                 self.tree.sortItems(0, self.tree.header().sortIndicatorOrder())
-            self.log("Unchecked items that were already identical (Similarity >= 1.0) and saved metadata.")
+            self.log("Unchecked items that were already identical (Similarity >= 1.0). (Will save on exit)")
         else:
             self.log("No identical items found to uncheck.")
 
@@ -2153,10 +2155,6 @@ class MainWindow(QMainWindow):
         # Atomic write to prevent 0-byte file on crash/error
         metadata_path = os.path.join(self.temp_dir_orig, "metadata.json")
         temp_path = metadata_path + ".tmp"
-        
-        # Ensure the directory exists (especially important for Image mode where Extract might be skipped)
-        os.makedirs(self.temp_dir_orig, exist_ok=True)
-
         try:
             with open(temp_path, 'w', encoding='utf-8') as f:
                 json.dump(clean_results, f, ensure_ascii=False, indent=2)
@@ -2184,11 +2182,17 @@ class MainWindow(QMainWindow):
         for i in range(self.tree.topLevelItemCount()):
             item = self.tree.topLevelItem(i)
             state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            # Ensure data is ALWAYS updated to match the 'checked' intent
+            idx = item.data(2, Qt.ItemDataRole.UserRole)
+            if idx is not None and 0 <= idx < len(self.results):
+                if self.results[idx].get('replace') != checked:
+                    self.results[idx]['replace'] = checked
+                    changed = True
+            
+            # Ensure UI is updated
             if item.checkState(0) != state:
                 item.setCheckState(0, state)
-                idx = item.data(2, Qt.ItemDataRole.UserRole)
-                if idx is not None and 0 <= idx < len(self.results):
-                    self.results[idx]['replace'] = checked
+                item.setData(0, Qt.ItemDataRole.UserRole, checked)
                 changed = True
         self.tree.blockSignals(False)
         
@@ -2196,7 +2200,8 @@ class MainWindow(QMainWindow):
             self.update_buttons()
             self.update_status_counts()
             self.update_copy_button_state()
-            self.log(f"{'Checked' if checked else 'Unchecked'} all items.")
+            self.tree.viewport().update()
+            self.log(f"{'Checked' if checked else 'Unchecked'} all items. (Will save on exit)")
 
     def inverse_all_items(self):
         self.tree.blockSignals(True)
@@ -2205,6 +2210,7 @@ class MainWindow(QMainWindow):
             is_checked = (item.checkState(0) == Qt.CheckState.Checked)
             new_state = Qt.CheckState.Unchecked if is_checked else Qt.CheckState.Checked
             item.setCheckState(0, new_state)
+            item.setData(0, Qt.ItemDataRole.UserRole, not is_checked)
             
             idx = item.data(2, Qt.ItemDataRole.UserRole)
             if idx is not None and 0 <= idx < len(self.results):
@@ -2213,7 +2219,8 @@ class MainWindow(QMainWindow):
         self.update_buttons()
         self.update_status_counts()
         self.update_copy_button_state()
-        self.log("Inversed all selections.")
+        self.tree.viewport().update()
+        self.log("Inversed all selections. (Will save on exit)")
 
     def on_selection_changed(self):
         self.update_status_counts()
@@ -2497,7 +2504,7 @@ class MainWindow(QMainWindow):
         # Requirement: "org 경로가 게임이고, mod 경로에 이미지 파일만 있거나, mod 임시 폴더에 이미 다 풀려서 이미지파일들이 있는 경우"
         # Translation: Orig is game, and (Mod is image OR Mod is extracted)
         mod_ready = (not is_mod_game) or mod_extracted
-        can_apply = (is_orig_game or mode == "Image") and mod_ready and has_results
+        can_apply = is_orig_game and mod_ready and has_results
         
         any_checked = any(r.get('replace', False) for r in self.results)
         
@@ -2514,12 +2521,13 @@ class MainWindow(QMainWindow):
         self.btn_toggle_expand.setEnabled(has_results and not is_running)
         self.btn_uncheck_same.setEnabled(has_results and not is_running)
 
-        is_unity_mode = mode in ["Unity", "Unity APK"]
-        self.chk_uabea_format.setVisible(is_unity_mode)
-        self.chk_uabea_format.setEnabled(is_unity_mode and not is_running)
-
+        # 6. Unity-specific options visibility (High Quality BC7, UABEA Format)
+        is_unity_mode = (mode in ["Unity", "Unity APK"])
         self.chk_high_quality.setVisible(is_unity_mode)
-        self.chk_high_quality.setEnabled(is_unity_mode and not is_running)
+        self.chk_high_quality.setEnabled(not is_running)
+        
+        self.chk_uabea_format.setVisible(is_unity_mode)
+        self.chk_uabea_format.setEnabled(not is_running)
 
         # UI Guarding: Disable tree and thumbnail interaction during tasks
         self.tree.setEnabled(not is_running)
@@ -2569,16 +2577,15 @@ class MainWindow(QMainWindow):
         target_dir = QFileDialog.getExistingDirectory(self, "Select Target Folder", self.orig_path.text())
         if not target_dir: return
 
-        self.start_worker("copy", 
-                          to_replace=to_replace, 
-                          target_dir=target_dir,
-                          orig_dir=os.path.normpath(self.orig_path.text()),
-                          mode=self.mode_combo.currentText(),
+        self.start_worker("copy", to_replace=to_replace, target_dir=target_dir,
                           use_uabea_format=self.chk_uabea_format.isChecked())
         self.update_buttons()
 
     def on_copy_finished(self, summary):
         self.update_buttons(is_finishing=True)
+        if 'successful_paths' in summary:
+            self._mark_items_as_replaced(summary['successful_paths'])
+        self._sync_metadata_to_disk()
         QMessageBox.information(self, "Success", f"Copied {summary['success']} files to {summary['target_dir']}")
         self.log(f"Copied {summary['success']} files to {summary['target_dir']}")
 
@@ -2613,8 +2620,14 @@ class MainWindow(QMainWindow):
             self.set_status_text(self.full_status_text)
 
 if __name__ == "__main__":
+    # Fix taskbar icon for Windows
+    try:
+        myappid = 'trimmer.unity.texturechanger.1.0' 
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except:
+        pass
+
     app = QApplication(sys.argv)
-    set_app_user_model_id() # Set AppUserModelID before creating the main window
     window = MainWindow()
     # Connect double click
     window.tree.itemDoubleClicked.connect(window.on_tree_double_clicked)

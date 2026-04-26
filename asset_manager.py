@@ -57,6 +57,13 @@ class AssetManager:
         if not candidates:
             return raw_data
             
+        if log_callback:
+            log_callback(f"      [STRIDE] Analyzing {width}x{height} (BPP: {bpp}, Row: {row_size}b)")
+            # Show top 4 candidates (4, 8, 16, 32)
+            temp_candidates = sorted(candidates, key=lambda x: x['score'], reverse=True)
+            for c in temp_candidates:
+                log_callback(f"        - Align {c['align']}: Stride {c['stride']}, Score {c['score']:.3f}")
+
         candidates.sort(key=lambda x: x['score'], reverse=True)
         best = candidates[0]
         
@@ -198,7 +205,7 @@ class AssetManager:
                             # For 2021.3.45, we prioritize our verified manual heuristic
                             if is_2021_3_45:
                                 try:
-                                    manual_img = self.manual_decode_texture2d(obj, log_callback=log if t2d_count <= 5 else None)
+                                    manual_img = self.manual_decode_texture2d(obj, log_callback=log)
                                     if manual_img:
                                         img = manual_img
                                         if t2d_count <= 5: log(f"    Forced Manual Parser successful for 2021.3.45.")
@@ -709,11 +716,13 @@ class AssetManager:
                             dlog(f"Detected Stream: {s_text} (Size: {pot_size})")
                             break
             
+            if log_callback and (obj.path_id == 26 or obj.path_id == 105 or "cursor" in name.lower()):
+                hex_head = raw[pos:pos+160].hex(' ', 4)
+                log_callback(f"      [DUMP] ID {obj.path_id} ({name}) Header: {hex_head}")
+
             # --- DYNAMIC STRUCTURAL SCANNER (Robust for 2021.3.x shifts) ---
-            # Instead of fixed offsets, we scan the header for [W, H, Size, Format] patterns
-            discovered_w, discovered_h, discovered_size, discovered_fmt = 0, 0, 0, 0
-            found_h_match = False
-            
+            # Collect ALL potential [W, H, Size, Format] candidates and pick the best one
+            candidates = []
             factors = [
                 (4, 4), (3, 3), (2, 2), (1, 12), (0.5, 10), (2, 13), 
                 (1, 1), (4, 5), (4, 26), (4, 27), (2, 47), (1, 34), (1, 45)
@@ -722,15 +731,42 @@ class AssetManager:
             for i in range(pos, min(len(raw), pos + 160), 4):
                 try:
                     w_t, h_t, size_t = struct.unpack("<iiI", raw[i:i+12])
-                    if 1 <= w_t <= 16384 and 1 <= h_t <= 16384:
-                        # Format is nearby
+                    if 32 <= w_t <= 16384 and 32 <= h_t <= 16384: # Prefer reasonable sizes first
                         for f_off in [12, 16, 20, 24]:
+                            if i + f_off + 4 > len(raw): continue
                             fmt_t = struct.unpack("<i", raw[i+f_off:i+f_off+4])[0]
                             if 1 <= fmt_t <= 64:
-                                discovered_w, discovered_h, discovered_size, discovered_fmt = w_t, h_t, size_t, fmt_t
-                                found_h_match = True; break
-                    if found_h_match: break
+                                # Validation: size_t must be somewhat proportional to w_t * h_t
+                                ratio = size_t / (w_t * h_t) if (w_t * h_t) > 0 else 0
+                                if 0.1 <= ratio <= 16:
+                                    candidates.append((w_t, h_t, size_t, fmt_t, i))
                 except: continue
+
+            # Fallback if no reasonable sized candidates found
+            if not candidates:
+                for i in range(pos, min(len(raw), pos + 160), 4):
+                    try:
+                        w_t, h_t, size_t = struct.unpack("<iiI", raw[i:i+12])
+                        if 1 <= w_t <= 16384 and 1 <= h_t <= 16384:
+                            for f_off in [12, 16, 20, 24]:
+                                if i + f_off + 4 > len(raw): continue
+                                fmt_t = struct.unpack("<i", raw[i+f_off:i+f_off+4])[0]
+                                if 1 <= fmt_t <= 64:
+                                    candidates.append((w_t, h_t, size_t, fmt_t, i))
+                    except: continue
+
+            discovered_w, discovered_h, discovered_size, discovered_fmt = 0, 0, 0, 0
+            discovered_colorspace = 1
+            
+            if candidates:
+                # Sort by resolution area (W * H) descending to find the "real" main texture
+                candidates.sort(key=lambda x: x[0] * x[1], reverse=True)
+                discovered_w, discovered_h, discovered_size, discovered_fmt, found_idx = candidates[0]
+                found_h_match = True
+                if log_callback:
+                    log_callback(f"      [SCAN] ID {obj.path_id}: Found {len(candidates)} candidates. Selected: {discovered_w}x{discovered_h} (Fmt: {discovered_fmt}, Size: {discovered_size})")
+            else:
+                found_h_match = False
 
             if not found_h_match:
                 dlog("Dynamic scanner failed. Using fallback offsets.")
@@ -777,28 +813,23 @@ class AssetManager:
 
             # CASE B: Local Data
             if not image_data:
-                # Find best vector match
-                best_v = None
-                best_diff = float('inf')
-                for v_start, v_len in vector_candidates:
-                    expected = discovered_size if discovered_size > 0 else (discovered_w * discovered_h)
-                    diff = abs(v_len - expected)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_v = (v_start, v_len)
-                
-                if best_v:
-                    v_start, v_len = best_v
-                    # Exhaustive sync search (Stride/Offset Alignment)
-                    target_align = 16 if discovered_fmt == 12 else (8 if discovered_fmt == 10 else 4)
-                    for offset in [0, 4, 8, 12, 16, 20, 24, 28, 32, 48, 64]:
-                        test_start = v_start + offset
-                        if test_start % target_align == 0:
-                            image_data = raw[test_start : v_start + v_len]
+                # Standard Unity ByteArray pattern: [Size (4b)] [Data (Size bytes)]
+                # The data block is almost always at the very end of the raw object data.
+                # We search for the size field that matches our discovered_size.
+                search_limit = found_idx + 12 # Skip the metadata we already found
+                for i in range(len(raw) - discovered_size - 4, search_limit - 1, -4):
+                    try:
+                        v_len = struct.unpack("<I", raw[i:i+4])[0]
+                        if v_len == discovered_size:
+                            test_start = i + 4
+                            # Alignment check (optional but good for sanity)
+                            target_align = 16 if discovered_fmt == 12 else (8 if discovered_fmt == 10 else 4)
+                            image_data = raw[test_start : test_start + v_len]
                             found_start = test_start
-                            dlog(f"MATCH (Local)! {discovered_w}x{discovered_h}, Format {discovered_fmt} at Sync {offset}")
+                            dlog(f"MATCH (Local)! {discovered_w}x{discovered_h}, Format {discovered_fmt} at Absolute Offset {test_start}")
                             break
-            
+                    except: continue
+
             if not image_data:
                 dlog("Data retrieval failed.")
                 return None
