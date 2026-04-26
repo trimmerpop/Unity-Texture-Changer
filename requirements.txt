@@ -1,0 +1,6 @@
+PyQt6
+UnityPy
+Pillow
+opencv-python
+numpy
+packaging

@@ -1,0 +1,9 @@
+/.vscode
+/build
+/config.ini
+/dist
+/temp_modified
+/temp_original
+/test
+/uber-apk-signer.jar
+/__pycache__
