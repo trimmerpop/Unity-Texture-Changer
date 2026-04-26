@@ -1,4 +1,6 @@
-# Unity Texture Changer (v2.0)
+[English](./README.md) | [한국어](./README_ko.md)
+
+# Unity Texture Changer
 
 유니티 에셋, APK 파일 또는 일반 이미지 폴더 내의 텍스처를 지능적으로 비교하고 교체할 수 있는 GUI 도구입니다. 지각적 해싱(Perceptual Hashing)과 구조적 유사도 알고리즘을 사용하여 원본과 수정본 사이의 매칭 작업을 자동화합니다.
 

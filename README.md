@@ -1,4 +1,6 @@
-# Unity Texture Changer (v2.0)
+[English](./README.md) | [한국어](./README_ko.md)
+
+# Unity Texture Changer
 
 A sophisticated GUI tool designed to intelligently compare and replace textures within Unity assets, APK files, or standard image folders. It leverages Perceptual Hashing and Structural Similarity algorithms to automate the matching process between original and modified versions.
 
