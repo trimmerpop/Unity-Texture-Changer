@@ -15,9 +15,21 @@ from PIL import Image
 from asset_manager import AssetManager
 from similarity import get_image_hash, hamming_similarity, compare_images, load_image
 from comparison_widget import ComparisonWidget
+import ctypes # For Windows taskbar icon fix
 import cv2
 import time
 from packaging import version
+
+def set_app_user_model_id():
+    """
+    Sets the Application User Model ID for the current process.
+    This helps Windows 7+ to correctly group taskbar icons.
+    """
+    if sys.platform == "win32":
+        # Arbitrary unique string for your application
+        my_app_id = u"UnityTextureChanger.App" 
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(my_app_id)
+
 
 class SortableTreeWidgetItem(QTreeWidgetItem):
     def natural_key(self, text):
@@ -903,7 +915,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Unity Texture Changer (v2.0)")
+        self.setWindowTitle("Unity Texture Changer")
         self.resize(1280, 800)
         self.results = []
         self.orig_textures = []
@@ -920,16 +932,19 @@ class MainWindow(QMainWindow):
         self.preview_thread.start()
 
         # Ensure temp folders are always relative to the executable/script location
+        # Asset/Bundled files are in _MEIPASS when frozen
         if getattr(sys, 'frozen', False):
-            base_dir = os.path.dirname(os.path.abspath(sys.executable))
+            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+            bundle_dir = getattr(sys, '_MEIPASS', exe_dir)
         else:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
+            exe_dir = os.path.dirname(os.path.abspath(__file__))
+            bundle_dir = exe_dir
 
-        self.temp_dir_orig = os.path.join(base_dir, "temp_original")
-        self.temp_dir_mod = os.path.join(base_dir, "temp_modified")
+        self.temp_dir_orig = os.path.join(exe_dir, "temp_original")
+        self.temp_dir_mod = os.path.join(exe_dir, "temp_modified")
         
         # Set Window Icon
-        icon_path = os.path.join(base_dir, "app_icon.ico")
+        icon_path = os.path.join(bundle_dir, "app_icon.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
             
@@ -2599,6 +2614,7 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    set_app_user_model_id() # Set AppUserModelID before creating the main window
     window = MainWindow()
     # Connect double click
     window.tree.itemDoubleClicked.connect(window.on_tree_double_clicked)

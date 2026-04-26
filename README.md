@@ -23,6 +23,7 @@ A sophisticated GUI tool designed to intelligently compare and replace textures 
   - Support for high-quality BC7 compression forcing.
 
 ## Requirements
+- You may need a lot of storage for your studies involving the extraction of asset files.
 
 ### Prerequisites
 - Python 3.10+
