@@ -93,7 +93,7 @@ class AssetManager:
         # 1. Searching for Unity files
         all_files = []
         # Obvious non-Unity files to skip in scan_all mode
-        skip_exts = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff', '.tif', '.json', '.txt', '.py', '.ini', '.bak', '.apk', '.exe', '.dll', '.wav', '.mp3', '.ogg', '.mp4')
+        skip_exts = ('.png', '.jpg', '.jpeg', '.json', '.txt', '.py', '.ini', '.bak', '.apk', '.exe', '.dll', '.wav', '.mp3', '.ogg', '.mp4')
         for root, dirs, files in os.walk(game_dir):
             for file in files:
                 filepath = os.path.join(root, file)
@@ -711,7 +711,7 @@ class AssetManager:
             
             # --- DYNAMIC STRUCTURAL SCANNER (Robust for 2021.3.x shifts) ---
             # Instead of fixed offsets, we scan the header for [W, H, Size, Format] patterns
-            discovered_w, discovered_h, discovered_size, discovered_fmt, discovered_colorspace = 0, 0, 0, 0, 1
+            discovered_w, discovered_h, discovered_size, discovered_fmt = 0, 0, 0, 0
             found_h_match = False
             
             factors = [

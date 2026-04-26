@@ -634,7 +634,7 @@ class WorkerThread(QThread):
                 prog = prog_start + int(pct * (prog_range / 100))
                 self.sig_progress.emit(prog, f"Extracting {label}: {text}")
             
-            textures = am.extract_textures(current_target_dir, temp_path, progress_callback=progress_cb, scan_all=scan_all)
+            textures = am.extract_textures(current_target_dir, temp_path, progress_callback=progress_cb, log_callback=self.sig_log.emit, scan_all=scan_all)
             # Ensure save_path and size are present
             for t in textures:
                 if 'file' in t and 'save_path' not in t:

@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('app_icon.ico', '.')]
 binaries = []
-hiddenimports = ['PyQt6.sip', 'UnityPy', 'PIL', 'cv2', 'numpy', 'packaging', 'packaging.version', 'packaging.specifiers', 'packaging.requirements']
+hiddenimports = ['PyQt6.sip', 'UnityPy', 'UnityPy.helpers.TypeTreeHelper', 'etcpak', 'brotli', 'lz4', 'zstandard', 'backports.lzma', 'PIL', 'cv2', 'numpy', 'packaging', 'packaging.version', 'packaging.specifiers', 'packaging.requirements']
 tmp_ret = collect_all('UnityPy')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
