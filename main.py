@@ -4,12 +4,12 @@ import shutil
 import json
 import zipfile
 import subprocess
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QSize, QUrl, QPoint, QRect, QCoreApplication, QSettings, QEvent
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLineEdit, QLabel, QFileDialog, QTableWidget, 
                              QTableWidgetItem, QHeaderView, QCheckBox, QProgressBar, QMenu,
                              QMessageBox, QInputDialog, QDialog, QListWidget, QListWidgetItem,
-                             QPlainTextEdit, QTreeWidget, QTreeWidgetItem, QComboBox, QSplitter)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QSize, QUrl, QPoint, QRect, QCoreApplication, QSettings
+                             QPlainTextEdit, QTreeWidget, QTreeWidgetItem, QComboBox, QSplitter, QFrame)
 from PyQt6.QtGui import QIcon, QAction, QDragEnterEvent, QDropEvent, QMouseEvent, QWheelEvent, QPixmap, QImage, QPainter, QPen, QFontMetrics
 from PIL import Image
 from asset_manager import AssetManager
@@ -185,6 +185,8 @@ class PathLineEdit(QLineEdit):
         urls = event.mimeData().urls()
         if urls:
             path = urls[0].toLocalFile()
+            if os.path.isfile(path) and not path.lower().endswith('.apk'):
+                path = os.path.dirname(path)
             self.setText(path)
 
 def get_base_name(name):
@@ -374,7 +376,6 @@ class WorkerThread(QThread):
             self.sig_log.emit(f"Processing direct file copies for {total_direct} items...")
             for i, res in enumerate(direct_files):
                 o = res['original']
-                bm = res['best_match']
                 
                 # SAFETY CHECK: If save_path is in temp folder, this is likely WRONG
                 if temp_orig in os.path.abspath(o['save_path']):
@@ -582,7 +583,8 @@ class WorkerThread(QThread):
                 if textures:
                     # Ensure save_path and size are present
                     for t in textures:
-                        t['save_path'] = os.path.join(temp_path, t['file'])
+                        if 'file' in t:
+                            t['save_path'] = os.path.join(temp_path, t['file'])
                         if 'size' not in t:
                             if os.path.exists(t['save_path']):
                                 t['size'] = os.path.getsize(t['save_path'])
@@ -605,8 +607,33 @@ class WorkerThread(QThread):
             def progress_cb(pct, text):
                 prog = prog_start + int(pct * (prog_range / 100))
                 self.sig_progress.emit(prog, f"Extracting {label}: {text}")
+
+            try:
+                textures = am.extract_textures(current_target_dir, temp_path, 
+                                            progress_callback=progress_cb, 
+                                            log_callback=self.sig_log.emit,
+                                            scan_all=scan_all)
+            except Exception as e:
+                self.sig_log.emit(f"ERROR: Extraction failed for {label}: {e}")
+                import traceback
+                self.sig_log.emit(traceback.format_exc())
+                return []
             
-            textures = am.extract_textures(current_target_dir, temp_path, progress_callback=progress_cb, scan_all=scan_all)
+            if not textures:
+                self.sig_log.emit(f"No Unity assets found in {label}. Checking for images...")
+                # Fallback: Scan images directly if no assets found
+                textures = []
+                for root, _, fnames in os.walk(current_target_dir):
+                    for f in fnames:
+                        if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                            path = os.path.join(root, f)
+                            textures.append({
+                                "name": os.path.splitext(f)[0],
+                                "save_path": path,
+                                "size": os.path.getsize(path)
+                            })
+                self.sig_log.emit(f"Found {len(textures)} images in {label} folder.")
+            
             # Ensure save_path and size are present
             for t in textures:
                 if 'file' in t and 'save_path' not in t:
@@ -888,12 +915,28 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Unity Texture Changer (v2.0)")
-        
+        # Determine internal resource path (sys._MEIPASS when frozen)
+        if getattr(sys, 'frozen', False):
+            self.res_dir = sys._MEIPASS
+            self.base_dir = os.path.dirname(sys.executable)
+        else:
+            self.res_dir = os.path.dirname(os.path.abspath(__file__))
+            self.base_dir = self.res_dir
+
         # Set Window Icon
-        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_icon.ico")
+        icon_path = os.path.join(self.res_dir, "app_icon.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
-            
+            print(f"Icon loaded from internal: {icon_path}")
+        else:
+            # Fallback to base_dir
+            icon_path = os.path.join(self.base_dir, "app_icon.ico")
+            if os.path.exists(icon_path):
+                self.setWindowIcon(QIcon(icon_path))
+                print(f"Icon loaded from external: {icon_path}")
+            else:
+                print(f"Icon NOT FOUND. Looked in: {self.res_dir} and {self.base_dir}")
+
         self.resize(1280, 800)
         self.results = []
         self.worker_thread = None
@@ -906,16 +949,46 @@ class MainWindow(QMainWindow):
         self.sig_request_preview.connect(self.preview_worker.run_preview)
         self.preview_worker.sig_preview_ready.connect(self.on_preview_ready)
         self.preview_thread.start()
-        self.temp_dir_orig = os.path.abspath("temp_original")
-        self.temp_dir_mod = os.path.abspath("temp_modified")
+        self.temp_dir_orig = os.path.join(self.base_dir, "temp_original")
+        self.temp_dir_mod = os.path.join(self.base_dir, "temp_modified")
+        
+        # Ensure they exist
+        os.makedirs(self.temp_dir_orig, exist_ok=True)
+        os.makedirs(self.temp_dir_mod, exist_ok=True)
+
         self.start_time = None
         self.current_orig_img = None
         self.current_pix = None
         self.last_viewport = (0, 0, 1, 1)
         self.worker_thread = None
         self._is_deleting = False
+        self.setAcceptDrops(True)
         self.init_ui()
         self.load_settings()
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent):
+        urls = event.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            if os.path.isfile(path) and not path.lower().endswith('.apk'):
+                path = os.path.dirname(path)
+                
+            if not self.orig_path.text().strip():
+                self.orig_path.setText(path)
+                self.on_path_changed_direct(path)
+                self.log(f"Auto-filled Original Path: {path}")
+            elif not self.mod_path.text().strip():
+                self.mod_path.setText(path)
+                self.on_path_changed_direct(path)
+                self.log(f"Auto-filled Modified Path: {path}")
+            else:
+                self.mod_path.setText(path)
+                self.on_path_changed_direct(path)
+                self.log(f"Overwrote Modified Path: {path}")
 
     def closeEvent(self, event):
         """Save metadata and settings on exit."""
@@ -1037,7 +1110,7 @@ class MainWindow(QMainWindow):
             self.txt_sim_cutoff.setText(str(settings.value("options/sim_cutoff", "0.5")))
             self.txt_sim_cutoff.setEnabled(sim_filter)
             
-            self.num_candidates.setText(str(settings.value("options/num_candidates", "5")))
+            self.num_candidates.setText(str(settings.value("options/num_candidates", "15")))
             
             highlight_diff = get_bool_val("options/highlight_diff", "true")
             self.diff_check.setChecked(highlight_diff)
@@ -1235,8 +1308,63 @@ class MainWindow(QMainWindow):
         self.tree.setHeaderLabels([
             "Replace", "Name", "Res", "Size", "Similarity", "Match File", "M-Res", "M-Size"
         ])
+        
+        # --- Frozen Column Setup ---
+        self.frozen_tree = EnhancedTreeWidget(self.tree)
+        self.frozen_tree.setColumnCount(8) # Mirror columns for sorting sync
+        self.frozen_tree.setHeaderLabels([
+            "Replace", "Name", "Res", "Size", "Similarity", "Match File", "M-Res", "M-Size"
+        ])
+        # Initially show Replace (0)
+        self.frozen_indices = [0]
+        for i in range(8):
+            self.frozen_tree.setColumnHidden(i, i not in self.frozen_indices)
+            
+        self.frozen_tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.frozen_tree.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.frozen_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.frozen_tree.setFrameShape(QFrame.Shape.NoFrame)
+        
+        # Sync vertical scroll
+        self.tree.verticalScrollBar().valueChanged.connect(self.frozen_tree.verticalScrollBar().setValue)
+        self.frozen_tree.verticalScrollBar().valueChanged.connect(self.tree.verticalScrollBar().setValue)
+        
+        # Sync column widths
+        self.tree.header().sectionResized.connect(self._sync_column_widths)
+        self.frozen_tree.header().sectionResized.connect(self._sync_column_widths)
+        
+        # Sync sorting
+        self.tree.header().sortIndicatorChanged.connect(
+            lambda idx, order: self.frozen_tree.sortByColumn(idx, order)
+        )
+        
+        # Sync expansion
+        self.tree.itemExpanded.connect(self._sync_frozen_expansion)
+        self.tree.itemCollapsed.connect(self._sync_frozen_collapse)
+        
+        # Sync selection
+        self.tree.itemSelectionChanged.connect(self._sync_frozen_selection)
+        
         self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.tree.header().setSectionsClickable(True)
+        self.tree.header().setSectionsMovable(False) # Keep columns in order
+        
+        # Initial Widths
+        replace_width = self.tree.fontMetrics().horizontalAdvance("Replace") + 45
+        name_width = 250 # Default name width
+        self.tree.setColumnWidth(0, replace_width)
+        self.tree.setColumnWidth(1, name_width)
+        self.frozen_tree.setColumnWidth(0, replace_width)
+        self.frozen_tree.setColumnWidth(1, name_width)
+        
+        # Both should be Interactive as requested
+        for i in self.frozen_indices:
+            self.tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+            self.frozen_tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+        
+        self.tree.installEventFilter(self)
+        self.frozen_tree.show()
+        # ---------------------------
         #self.tree.header().sectionClicked.connect(self.on_header_clicked)
         self.tree.itemSelectionChanged.connect(self.on_selection_changed)
         self.tree.itemChanged.connect(self.on_item_changed)
@@ -1643,12 +1771,12 @@ class MainWindow(QMainWindow):
         
         if not hasattr(self, 'orig_textures') or not self.orig_textures:
             self.orig_textures = self.get_asset_manager().load_metadata(self.temp_dir_orig) or []
-            if not self.orig_textures and is_image_mode:
+            if not self.orig_textures:
                 self.orig_textures = self.scan_image_folder(self.orig_path.text())
                 
         if not hasattr(self, 'mod_textures') or not self.mod_textures:
             self.mod_textures = self.get_asset_manager().load_metadata(self.temp_dir_mod) or []
-            if not self.mod_textures and is_image_mode:
+            if not self.mod_textures:
                 self.mod_textures = self.scan_image_folder(self.mod_path.text())
             
         if not self.orig_textures or not self.mod_textures:
@@ -1784,9 +1912,13 @@ class MainWindow(QMainWindow):
         sort_order = header.sortIndicatorOrder()
         
         self.tree.setUpdatesEnabled(False)
+        self.frozen_tree.setUpdatesEnabled(False)
         self.tree.setSortingEnabled(False)
+        self.frozen_tree.setSortingEnabled(False)
         self.tree.blockSignals(True)
+        self.frozen_tree.blockSignals(True)
         self.tree.clear()
+        self.frozen_tree.clear()
         
         import time
         start_update = time.time()
@@ -1814,19 +1946,32 @@ class MainWindow(QMainWindow):
             orig = res['original']
             # Parent item
             item = SortableTreeWidgetItem()
+            f_item = SortableTreeWidgetItem(self.frozen_tree)
+            # Link items bi-directionally using UserRole+5
+            item.setData(0, Qt.ItemDataRole.UserRole + 5, f_item)
+            f_item.setData(0, Qt.ItemDataRole.UserRole + 5, item)
+
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            f_item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             
             # Original Replace Checkbox state
             is_replace = res.get('replace', True)
             item.setCheckState(0, Qt.CheckState.Checked if is_replace else Qt.CheckState.Unchecked)
             item.setData(0, Qt.ItemDataRole.UserRole, is_replace)
+            f_item.setCheckState(0, item.checkState(0))
+            f_item.setData(0, Qt.ItemDataRole.UserRole, is_replace)
             
             item.setText(1, orig.get('name', 'Unknown'))
+            f_item.setText(1, item.text(1))
             item.setText(2, f"{orig.get('width', 0)}x{orig.get('height', 0)}")
+            f_item.setText(2, item.text(2))
             item.setText(3, f"{orig.get('size', 0)/1024:.1f} KB")
+            f_item.setText(3, item.text(3))
             # Store the result object and its original index
             item.setData(1, Qt.ItemDataRole.UserRole, res)
             item.setData(2, Qt.ItemDataRole.UserRole, i)
+            f_item.setData(1, Qt.ItemDataRole.UserRole, res)
+            f_item.setData(2, Qt.ItemDataRole.UserRole, i)
             
             # If we have a match file, update the columns
             if res.get('match_file'):
@@ -1855,17 +2000,29 @@ class MainWindow(QMainWindow):
                 for cand in sorted_candidates:
                     c_sim = cand['similarity']
                     c_item = SortableTreeWidgetItem(item)
+                    cf_item = SortableTreeWidgetItem(f_item)
+                    # Link items bi-directionally
+                    c_item.setData(0, Qt.ItemDataRole.UserRole + 5, cf_item)
+                    cf_item.setData(0, Qt.ItemDataRole.UserRole + 5, c_item)
+
                     c_item.setFlags(c_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    cf_item.setFlags(cf_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     
                     # Exclusive Checkbox for candidate
                     is_this_match = (res.get('match_file') == cand['save_path'])
                     c_item.setCheckState(0, Qt.CheckState.Checked if is_this_match else Qt.CheckState.Unchecked)
                     c_item.setData(0, Qt.ItemDataRole.UserRole, is_this_match)
+                    cf_item.setCheckState(0, c_item.checkState(0))
+                    cf_item.setData(0, Qt.ItemDataRole.UserRole, is_this_match)
                     
                     c_item.setText(1, cand.get('name', 'Unknown'))
+                    cf_item.setText(1, c_item.text(1))
                     c_item.setText(2, f"{cand.get('width', 0)}x{cand.get('height', 0)}")
+                    cf_item.setText(2, c_item.text(2))
                     c_item.setText(3, f"{cand.get('size', 0)/1024:.1f} KB")
+                    cf_item.setText(3, c_item.text(3))
                     c_item.setText(4, f"{c_sim:.4f}")
+                    cf_item.setText(4, c_item.text(4))
                     # Change: cand is already in a simplified format
                     c_item.setData(1, Qt.ItemDataRole.UserRole, cand)
 
@@ -1873,6 +2030,7 @@ class MainWindow(QMainWindow):
                     green_brush = Qt.GlobalColor.green
                     if cand.get('name') == orig.get('name'):
                         c_item.setBackground(1, green_brush)
+                        cf_item.setBackground(1, green_brush)
                     if cand.get('width') == orig.get('width') and cand.get('height') == orig.get('height'):
                         c_item.setBackground(2, green_brush)
                     if cand.get('size') == orig.get('size'):
@@ -1882,12 +2040,16 @@ class MainWindow(QMainWindow):
 
         self.tree.addTopLevelItems(all_top_items)
         self.tree.blockSignals(False)
+        self.frozen_tree.blockSignals(False)
         
         # Restore sort state
         self.tree.setSortingEnabled(True)
         self.tree.sortByColumn(sort_col, sort_order)
+        self.frozen_tree.setSortingEnabled(True)
+        self.frozen_tree.sortByColumn(sort_col, sort_order)
         
         self.tree.setUpdatesEnabled(True)
+        self.frozen_tree.setUpdatesEnabled(True)
         self.update_status_counts()
         self.update_buttons()
         # Reset progress bar after tree construction is fully finished
@@ -1938,6 +2100,21 @@ class MainWindow(QMainWindow):
         if column != 0: return
         is_checked = (item.checkState(0) == Qt.CheckState.Checked)
         
+        # Sync between main and frozen tree
+        if item.treeWidget() == self.frozen_tree:
+            # Finding the main item to sync back
+            main_item = item.data(0, Qt.ItemDataRole.UserRole + 5)
+            if main_item:
+                self.tree.blockSignals(True)
+                main_item.setCheckState(0, item.checkState(0))
+                self.tree.blockSignals(False)
+        elif item.treeWidget() == self.tree:
+            f_item = item.data(0, Qt.ItemDataRole.UserRole + 5)
+            if f_item:
+                self.frozen_tree.blockSignals(True)
+                f_item.setCheckState(0, item.checkState(0))
+                self.frozen_tree.blockSignals(False)
+
         parent = item.parent()
         if parent:
             # Child Item (Candidate)
@@ -2316,6 +2493,9 @@ class MainWindow(QMainWindow):
         path1 = orig_tex['save_path']
         path2 = match_tex['save_path'] if match_tex else None
         
+        # Show loading indicator in comparison view
+        self.comp_widget.set_loading(True)
+        
         # Trigger background preview
         self.current_preview_id += 1
         self.sig_request_preview.emit(self.current_preview_id, path1, path2 if path2 else "", self.diff_check.isChecked())
@@ -2324,6 +2504,58 @@ class MainWindow(QMainWindow):
         self.last_viewport = (x, y, w, h)
         if self.current_orig_img:
             self.draw_thumbnail_viewport()
+
+    # --- Frozen Column Helpers ---
+    def _sync_frozen_expansion(self, item):
+        f_item = item.data(0, Qt.ItemDataRole.UserRole + 5)
+        if f_item: f_item.setExpanded(True)
+
+    def _sync_frozen_collapse(self, item):
+        f_item = item.data(0, Qt.ItemDataRole.UserRole + 5)
+        if f_item: f_item.setExpanded(False)
+
+    def _sync_frozen_selection(self):
+        if not hasattr(self, 'frozen_tree'): return
+        self.frozen_tree.blockSignals(True)
+        self.frozen_tree.clearSelection()
+        for item in self.tree.selectedItems():
+            f_item = item.data(0, Qt.ItemDataRole.UserRole + 5)
+            if f_item:
+                f_item.setSelected(True)
+        self.frozen_tree.blockSignals(False)
+
+    def eventFilter(self, obj, event):
+        if obj == self.tree and event.type() == QEvent.Type.Resize:
+            self.update_frozen_geometry()
+        return super().eventFilter(obj, event)
+
+    def update_frozen_geometry(self):
+        if not hasattr(self, 'frozen_tree'): return
+        # Position frozen tree to cover all frozen columns
+        fw = self.tree.frameWidth()
+        total_frozen_width = 0
+        for i in self.frozen_indices:
+            total_frozen_width += self.tree.columnWidth(i)
+            
+        self.frozen_tree.setGeometry(
+            fw, 
+            fw, 
+            total_frozen_width, 
+            self.tree.height() - 2*fw
+        )
+
+    def _sync_column_widths(self, index, old_size, new_size):
+        if getattr(self, '_is_syncing_widths', False): return
+        self._is_syncing_widths = True
+        try:
+            sender = self.sender()
+            target = self.frozen_tree.header() if sender == self.tree.header() else self.tree.header()
+            if target.sectionSize(index) != new_size:
+                target.resizeSection(index, new_size)
+            if index in self.frozen_indices:
+                self.update_frozen_geometry()
+        finally:
+            self._is_syncing_widths = False
 
     def _update_thumbnail_size(self):
         if not hasattr(self, 'current_pix') or self.current_pix is None or self.current_pix.isNull():
@@ -2499,12 +2731,10 @@ class MainWindow(QMainWindow):
         # 4. Apply / Copy
         has_results = bool(getattr(self, 'results', None))
         
-        # Apply logic: orig must be a game (to apply back) and mod must be ready
-        # If both are images, apply usually means copy (overwriting orig).
-        # Requirement: "org 경로가 게임이고, mod 경로에 이미지 파일만 있거나, mod 임시 폴더에 이미 다 풀려서 이미지파일들이 있는 경우"
-        # Translation: Orig is game, and (Mod is image OR Mod is extracted)
-        mod_ready = (not is_mod_game) or mod_extracted
-        can_apply = is_orig_game and mod_ready and has_results
+        # Apply logic: Allow in Unity/APK modes (is_orig_game) OR direct Image mode
+        # Requirement: Orig is game/folder, and (Mod is image OR Mod is extracted)
+        mod_ready = (mode == "Image") or (not is_mod_game) or mod_extracted
+        can_apply = (is_orig_game or mode == "Image") and mod_ready and has_results
         
         any_checked = any(r.get('replace', False) for r in self.results)
         
@@ -2588,6 +2818,62 @@ class MainWindow(QMainWindow):
         self._sync_metadata_to_disk()
         QMessageBox.information(self, "Success", f"Copied {summary['success']} files to {summary['target_dir']}")
         self.log(f"Copied {summary['success']} files to {summary['target_dir']}")
+
+    def on_apply_finished(self, summary):
+        self.update_buttons(is_finishing=True)
+        if summary.get('success', 0) > 0:
+            if 'successful_paths' in summary:
+                self._mark_items_as_replaced(summary['successful_paths'])
+            
+            # Save the updated results immediately to metadata.json
+            self._sync_metadata_to_disk()
+            
+            QMessageBox.information(self, "Success", f"Successfully applied {summary['success']} changes.")
+            self.log(f"Successfully applied {summary['success']} changes.")
+        else:
+            QMessageBox.warning(self, "Failed", "No changes were applied. Check logs.")
+            self.log("Apply changes failed or no files were modified.")
+
+    def _mark_items_as_replaced(self, successful_paths):
+        """
+        Updates the similarity to 1.0 and unchecks the 'replace' status for successfully modified items.
+        Updates both the internal data (self.results) and the UI Tree.
+        """
+        if not successful_paths or not self.results:
+            return
+            
+        # Convert list to set for O(1) lookup
+        success_set = set(os.path.normpath(p) for p in successful_paths)
+        
+        changed_indices = []
+        for i, res in enumerate(self.results):
+            # The worker sends r['original']['save_path'] for each successful item
+            orig_path = res.get('original', {}).get('save_path')
+            if orig_path and os.path.normpath(orig_path) in success_set:
+                res['best_similarity'] = 1.0
+                res['replace'] = False
+                changed_indices.append(i)
+        
+        if changed_indices:
+            # Update UI Tree items
+            for i in range(self.tree.topLevelItemCount()):
+                item = self.tree.topLevelItem(i)
+                idx = item.data(2, Qt.ItemDataRole.UserRole)
+                if idx in changed_indices:
+                    res = self.results[idx]
+                    # Update Similarity column (index 4)
+                    item.setText(4, "1.000")
+                    
+                    # Uncheck the item
+                    item.setCheckState(0, Qt.CheckState.Unchecked)
+                    item.setData(0, Qt.ItemDataRole.UserRole, False)
+                    
+                    # Update status column (index 5) - usually "Matched" or something
+                    # item.setText(5, "Replaced")
+                    
+            self.update_status_counts()
+            self.update_copy_button_state()
+            self.log(f"Updated {len(changed_indices)} items in list as successfully replaced (Similarity -> 1.0).")
 
     def apply_changes(self):
         to_replace = [r for r in self.results if r.get('replace') and r.get('match_file')]

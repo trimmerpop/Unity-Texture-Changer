@@ -55,6 +55,25 @@ python build_exe.py
 ```
 The output will be located in the `dist` folder.
 
+## Hotkeys & Controls
+
+### List (Results)
+- **`Space`**: Toggle the 'Replace' checkbox for selected items. (Always checks sub-items).
+- **`Delete`**: Remove selected original or candidate items from the list.
+- **`+` (or `=`)**: Check all items for replacement.
+- **`-`**: Uncheck all items.
+- **`*` (Asterisk)**: Inverse all selection states.
+- **`Double Click`**: (Original items) Scroll to and center the texture in the comparison view.
+
+### Comparison Viewer
+- **`Mouse Wheel`**: Zoom in/out relative to the mouse pointer.
+- **`Left Drag`**: Pan/Scroll images.
+- **`Top Right Thumbnail Click`**: Jump to the clicked position on the texture.
+
+### Paths
+- **`Double Click`**: Open folder selection dialog.
+- **`Drag & Drop`**: Drop folders or APK files directly onto the input fields.
+
 ## Important Notes
 
 - **Backup**: 'Apply Changes' modifies original files. Always create a backup before proceeding.

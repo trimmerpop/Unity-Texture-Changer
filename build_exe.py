@@ -35,6 +35,8 @@ def build():
         "--hidden-import=packaging.requirements",
         "--add-data=app_icon.ico;.",
         "--collect-all=UnityPy",
+        "--collect-all=archspec",
+        "--collect-all=astc_encoder",
         "main.py"
     ]
     

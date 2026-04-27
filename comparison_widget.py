@@ -20,12 +20,15 @@ class ImageLabel(QLabel):
         
     def set_image(self, pixmap):
         self.main_pixmap = pixmap
+        if pixmap and not pixmap.isNull():
+            self.setText("")
         self.update_view()
         
     def update_view(self):
         if not self.main_pixmap:
-            self.setPixmap(QPixmap())
-            self.setFixedSize(0, 0)
+            if not self.text():
+                self.setPixmap(QPixmap())
+                self.setFixedSize(0, 0)
             return
             
         scaled_size = self.main_pixmap.size() * self.zoom_factor
@@ -102,6 +105,10 @@ class ComparisonWidget(QWidget):
         self.current_img2_path = img2_path
         self.diff_mode = show_diff
         
+        # Clear loading state
+        self.original_label.setText("")
+        self.matched_label.setText("")
+        
         def get_safe_pixmap(path):
             """Unifies loading using the standardized analytical pipeline (load_image)."""
             if not path or not os.path.exists(path): return QPixmap()
@@ -145,6 +152,26 @@ class ComparisonWidget(QWidget):
             
         self.matched_label.set_image(get_safe_pixmap(img2_path))
         self.emit_viewport_changed()
+
+    def set_loading(self, loading=True):
+        if loading:
+            # Show loading text
+            loading_style = "font-size: 18px; font-weight: bold; color: #888;"
+            self.original_label.setText("Loading...")
+            self.original_label.setStyleSheet(loading_style)
+            self.original_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            # Make labels fill viewport for centering
+            self.original_label.setFixedSize(self.original_scroll.viewport().size())
+            
+            self.matched_label.setText("Loading...")
+            self.matched_label.setStyleSheet(loading_style)
+            self.matched_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.matched_label.setFixedSize(self.matched_scroll.viewport().size())
+        else:
+            self.original_label.setText("")
+            self.matched_label.setText("")
+            self.original_label.setStyleSheet("")
+            self.matched_label.setStyleSheet("")
 
     def emit_viewport_changed(self):
         if not self.original_label.main_pixmap: return
