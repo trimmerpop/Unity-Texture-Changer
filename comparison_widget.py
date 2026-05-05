@@ -96,84 +96,95 @@ class ComparisonWidget(QWidget):
         self.original_scroll.horizontalScrollBar().valueChanged.connect(lambda: self.emit_viewport_changed())
         self.original_scroll.verticalScrollBar().valueChanged.connect(lambda: self.emit_viewport_changed())
             
+        self._is_updating = False
         self.diff_mode = False
         self.current_img1_path = None
         self.current_img2_path = None
 
     def set_images(self, img1_path, img2_path, show_diff=False):
-        self.current_img1_path = img1_path
-        self.current_img2_path = img2_path
-        self.diff_mode = show_diff
-        
-        # Clear loading state
-        self.original_label.setText("")
-        self.matched_label.setText("")
-        
-        def get_safe_pixmap(path):
-            """Unifies loading using the standardized analytical pipeline (load_image)."""
-            if not path or not os.path.exists(path): return QPixmap()
+        self._is_updating = True
+        try:
+            self.current_img1_path = img1_path
+            self.current_img2_path = img2_path
+            self.diff_mode = show_diff
             
-            try:
-                from similarity import load_image
-                img = load_image(path) # returns uint8 BGRA
-                if img is None:
-                    # Final fallback to native Qt
-                    return QPixmap(path)
+            # Clear loading state
+            self.original_label.setText("")
+            self.matched_label.setText("")
+            
+            def get_safe_pixmap(path):
+                """Unifies loading using the standardized analytical pipeline (load_image)."""
+                if not path or not os.path.exists(path): return QPixmap()
                 
-                # Standardize using a PNG-encoded buffer handoff
-                success, buffer = cv2.imencode('.png', img)
-                if success:
-                    qimg = QImage()
-                    if qimg.loadFromData(buffer.tobytes()):
-                        return QPixmap.fromImage(qimg)
-                
-            except Exception as e:
-                print(f"Standardized loading failed for {path}: {e}")
-                return QPixmap(path)
-
-        if self.diff_mode:
-            from similarity import get_difference_mask
-            diff_img = get_difference_mask(img1_path, img2_path, grayscale_bg=False)
-            if diff_img is not None:
                 try:
-                    success, buffer = cv2.imencode('.png', diff_img)
+                    from similarity import load_image
+                    img = load_image(path) # returns uint8 BGRA
+                    if img is None:
+                        # Final fallback to native Qt
+                        return QPixmap(path)
+                    
+                    # Standardize using a PNG-encoded buffer handoff
+                    success, buffer = cv2.imencode('.png', img)
                     if success:
                         qimg = QImage()
                         if qimg.loadFromData(buffer.tobytes()):
-                            self.original_label.set_image(QPixmap.fromImage(qimg))
+                            return QPixmap.fromImage(qimg)
+                    
                 except Exception as e:
-                    print(f"Comparison diff rendering failed: {e}")
-                    # Use existing safe pixmap logic
+                    print(f"Standardized loading failed for {path}: {e}")
+                    return QPixmap(path)
+                return QPixmap()
+
+            if self.diff_mode:
+                from similarity import get_difference_mask
+                diff_img = get_difference_mask(img1_path, img2_path, grayscale_bg=False)
+                if diff_img is not None:
+                    try:
+                        success, buffer = cv2.imencode('.png', diff_img)
+                        if success:
+                            qimg = QImage()
+                            if qimg.loadFromData(buffer.tobytes()):
+                                self.original_label.set_image(QPixmap.fromImage(qimg))
+                    except Exception as e:
+                        print(f"Comparison diff rendering failed: {e}")
+                        # Use existing safe pixmap logic
+                        self.original_label.set_image(get_safe_pixmap(img1_path))
+                else:
                     self.original_label.set_image(get_safe_pixmap(img1_path))
             else:
                 self.original_label.set_image(get_safe_pixmap(img1_path))
-        else:
-            self.original_label.set_image(get_safe_pixmap(img1_path))
-            
-        self.matched_label.set_image(get_safe_pixmap(img2_path))
+                
+            self.matched_label.set_image(get_safe_pixmap(img2_path))
+        finally:
+            self._is_updating = False
         self.emit_viewport_changed()
 
     def set_loading(self, loading=True):
-        if loading:
-            # Show loading text
-            loading_style = "font-size: 18px; font-weight: bold; color: #888;"
-            self.original_label.setText("Loading...")
-            self.original_label.setStyleSheet(loading_style)
-            self.original_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            # Make labels fill viewport for centering
-            self.original_label.setFixedSize(self.original_scroll.viewport().size())
-            
-            self.matched_label.setText("Loading...")
-            self.matched_label.setStyleSheet(loading_style)
-            self.matched_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.matched_label.setFixedSize(self.matched_scroll.viewport().size())
-        else:
-            self.original_label.setText("")
-            self.matched_label.setText("")
-            self.original_label.setStyleSheet("")
-            self.matched_label.setStyleSheet("")
+        self._is_updating = True
+        try:
+            if loading:
+                # Show loading text
+                loading_style = "font-size: 18px; font-weight: bold; color: #888;"
+                self.original_label.setText("Loading...")
+                self.original_label.setStyleSheet(loading_style)
+                self.original_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                # Make labels fill viewport for centering
+                self.original_label.setFixedSize(self.original_scroll.viewport().size())
+                
+                self.matched_label.setText("Loading...")
+                self.matched_label.setStyleSheet(loading_style)
+                self.matched_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.matched_label.setFixedSize(self.matched_scroll.viewport().size())
+            else:
+                self.original_label.setText("")
+                self.matched_label.setText("")
+                self.original_label.setStyleSheet("")
+                self.matched_label.setStyleSheet("")
+        finally:
+            self._is_updating = False
 
     def emit_viewport_changed(self):
+        if self._is_updating: return
         if not self.original_label.main_pixmap: return
         h_bar = self.original_scroll.horizontalScrollBar()
         v_bar = self.original_scroll.verticalScrollBar()
@@ -205,6 +216,13 @@ class ComparisonWidget(QWidget):
         
         h_bar.setValue(target_x)
         v_bar.setValue(target_y)
+
+    def set_scroll_normalized(self, x_norm, y_norm):
+        """Sets scroll position to top-left normalized coordinates."""
+        if not self.original_label.main_pixmap: return
+        label_size = self.original_label.size()
+        self.original_scroll.horizontalScrollBar().setValue(int(x_norm * label_size.width()))
+        self.original_scroll.verticalScrollBar().setValue(int(y_norm * label_size.height()))
 
     def wheelEvent(self, event: QWheelEvent):
         angle = event.angleDelta().y()

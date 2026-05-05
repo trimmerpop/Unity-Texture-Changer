@@ -76,7 +76,8 @@ class AssetManager:
             for file in files:
                 filepath = os.path.join(root, file)
                 file_lower = file.lower()
-                if file_lower.endswith(('.bak', '.apk')): continue
+                # USER: "unity mode가 되는데, assets을 추출할 때, apk 파일은 제외하고 작업하도록 해."
+                if file_lower.endswith(('.bak', '.apk', '.zip', '.rar', '.7z')): continue
                 if scan_all:
                     if not file_lower.endswith(skip_exts): all_files.append(filepath)
                 else:

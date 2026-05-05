@@ -4,7 +4,7 @@ import shutil
 import json
 import zipfile
 import subprocess
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QSize, QUrl, QPoint, QRect, QCoreApplication, QSettings, QEvent
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QSize, QUrl, QPoint, QRect, QCoreApplication, QSettings, QEvent, QTimer
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLineEdit, QLabel, QFileDialog, QTableWidget, 
                              QTableWidgetItem, QHeaderView, QCheckBox, QProgressBar, QMenu,
@@ -104,8 +104,8 @@ class SortableTreeWidgetItem(QTreeWidgetItem):
                 if v1 != v2:
                     return v1 > v2  # Checked before Unchecked
 
-        # Natural sorting for Name (1, 5)
-        if column in (1, 5):
+        # Natural sorting for Name (1, 7) or Assets (5) or Match File (7)
+        if column in (1, 5, 7):
             t1 = self.text(column)
             t2 = other.text(column)
             n1 = self.natural_key(t1)
@@ -114,14 +114,14 @@ class SortableTreeWidgetItem(QTreeWidgetItem):
             if t1 != t2: return t1 < t2
             return tie_breaker()
 
-        # Column 2, 6: Resolution (Numeric)
-        if column in (2, 6):
+        # Column 2, 8: Resolution (Numeric)
+        if column in (2, 8):
             v1 = self.get_pixels(self.text(column))
             v2 = self.get_pixels(other.text(column))
             if v1 != v2: return v1 < v2
 
-        # Column 3, 7: Size (Numeric)
-        if column in (3, 7):
+        # Column 3, 9: Size (Numeric)
+        if column in (3, 9):
             v1 = self.get_bytes(self.text(column))
             v2 = self.get_bytes(other.text(column))
             if v1 != v2: return v1 < v2
@@ -132,6 +132,14 @@ class SortableTreeWidgetItem(QTreeWidgetItem):
                 s1 = float(self.text(4) or "0")
                 s2 = float(other.text(4) or "0")
                 if s1 != s2: return s1 < s2
+            except: pass
+
+        # Column 6: PathID (Numeric)
+        if column == 6:
+            try:
+                v1 = int(self.text(6) or "0")
+                v2 = int(other.text(6) or "0")
+                if v1 != v2: return v1 < v2
             except: pass
 
         # If everything else is equal, use tie-breaker
@@ -175,7 +183,7 @@ class PathLineEdit(QLineEdit):
     def mouseDoubleClickEvent(self, event):
         path = QFileDialog.getExistingDirectory(self, "Select Folder")
         if path:
-            self.setText(path)
+            self.setText(resolve_apk_path(path))
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -187,7 +195,32 @@ class PathLineEdit(QLineEdit):
             path = urls[0].toLocalFile()
             if os.path.isfile(path) and not path.lower().endswith('.apk'):
                 path = os.path.dirname(path)
-            self.setText(path)
+            self.setText(resolve_apk_path(path))
+
+def resolve_apk_path(path):
+    """If path is a folder containing APKs, returns the best APK path. 
+    Otherwise returns the original path. 
+    Excludes *_mod.apk if multiple APKs are present."""
+    if not path or not os.path.exists(path): return path
+    if path.lower().endswith('.apk'): return path
+    if os.path.isdir(path):
+        try:
+            apks = [f for f in os.listdir(path) if f.lower().endswith('.apk')]
+            if not apks: return path
+            
+            if len(apks) == 1:
+                return os.path.join(path, apks[0])
+            
+            # If multiple, filter out *_mod.apk
+            non_mod_apks = [f for f in apks if not f.lower().endswith('_mod.apk')]
+            if non_mod_apks:
+                # Pick the first non-mod APK
+                return os.path.join(path, non_mod_apks[0])
+            
+            # Fallback to the first APK if all are _mod.apk
+            return os.path.join(path, apks[0])
+        except: pass
+    return path
 
 def get_base_name(name):
     """Strips Unity-style _PathID suffixes (e.g., _12345) from texture names."""
@@ -200,32 +233,13 @@ class EnhancedTreeWidget(QTreeWidget):
     sig_delete_items = pyqtSignal()
     sig_check_all = pyqtSignal(bool)
     sig_inverse_all = pyqtSignal()
+    sig_space_pressed = pyqtSignal()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space:
-            selected = self.selectedItems()
-            if selected:
-                # Sub-items (candidates) should ALWAYS be checked, not toggled.
-                # Top-level items (originals) should be toggled based on the first item's current state.
-                first_item = selected[0]
-                if first_item.parent():
-                    # If the first selected item is a sub-item, we intend to check all selected sub-items.
-                    new_state_for_parents = Qt.CheckState.Checked 
-                else:
-                    first_state = first_item.checkState(0)
-                    new_state_for_parents = Qt.CheckState.Checked if first_state == Qt.CheckState.Unchecked else Qt.CheckState.Unchecked
-                
-                for item in selected:
-                    if item.parent():
-                        # Candidates: Always check
-                        item.setCheckState(0, Qt.CheckState.Checked)
-                    else:
-                        # Originals: Toggle
-                        item.setCheckState(0, new_state_for_parents)
-                
-                # Prevent default space handling (scrolling)
-                event.accept()
-                return
+            self.sig_space_pressed.emit()
+            event.accept()
+            return
         elif event.key() == Qt.Key.Key_Delete:
             self.sig_delete_items.emit()
             event.accept()
@@ -417,18 +431,27 @@ class WorkerThread(QThread):
                 try:
                     # Create temporary unsigned APK
                     unsigned_apk_path = os.path.join(temp_orig, f"temp_unsigned_{os.path.basename(original_apk_path)}")
-                    self.sig_log.emit(f"Rebuilding APK with {len(modified_files)} modified files...")
-
-                    modified_files_map = {os.path.relpath(f, extract_dir): f for f in modified_files}
+                    # Normalize paths to use forward slashes for ZIP internal matching
+                    modified_files_map = {}
+                    for f in modified_files:
+                        rel_p = os.path.relpath(f, extract_dir).replace('\\', '/')
+                        modified_files_map[rel_p] = f
+                        self.sig_log.emit(f"  Detected modified asset for APK: {rel_p}")
                     
                     with zipfile.ZipFile(original_apk_path, 'r') as zin:
                         with zipfile.ZipFile(unsigned_apk_path, 'w') as zout:
                             for item in zin.infolist():
+                                # Match using forward-slash normalized paths
                                 if item.filename in modified_files_map:
                                     mod_file = modified_files_map[item.filename]
-                                    compress_type = zipfile.ZIP_STORED if item.filename.lower().endswith('.so') else zipfile.ZIP_DEFLATED
+                                    # Use original compression type if possible, or default to DEFLATED
+                                    # Note: .so files often need ZIP_STORED (no compression)
+                                    compress_type = item.compress_type
+                                    if item.filename.lower().endswith('.so') and compress_type != zipfile.ZIP_STORED:
+                                        compress_type = zipfile.ZIP_STORED
+                                        
                                     zout.write(mod_file, item.filename, compress_type=compress_type)
-                                    self.sig_log.emit(f"  -> Updated: {item.filename}")
+                                    self.sig_log.emit(f"  -> Successfully Injected: {item.filename}")
                                 else:
                                     buffer = zin.read(item.filename)
                                     zout.writestr(item, buffer)
@@ -521,8 +544,18 @@ class WorkerThread(QThread):
             current_target_dir = folder_path
             apk_found_path = None
             
-            if is_apk_mode:
-                # Environment Check for APK Mode
+            # Detect if this specific path is an APK file, regardless of mode
+            if folder_path.lower().endswith('.apk'):
+                apk_found_path = folder_path
+            elif is_apk_mode and os.path.isdir(folder_path):
+                # Only if in APK mode AND it's a directory, we search for APK inside
+                for f in os.listdir(folder_path):
+                    if f.lower().endswith('.apk'):
+                        apk_found_path = os.path.join(folder_path, f)
+                        break
+            
+            # Environment Check (Only if we found an APK AND it's for the Original path in Unity APK mode)
+            if apk_found_path and is_apk_mode and label == "Original":
                 java_ok = shutil.which("java") is not None
                 jar_path = self._find_uber_apk_signer_jar()
 
@@ -540,15 +573,6 @@ class WorkerThread(QThread):
                     clean_error = error_msg.replace('\n', ' ')
                     self.sig_log.emit(f"ERROR: {clean_error}")
                     self.sig_error.emit("Environment Warning", error_msg)
-                
-                # Find APK file in folder_path or folder_path itself
-                if folder_path.lower().endswith('.apk'):
-                    apk_found_path = folder_path
-                else:
-                    for f in os.listdir(folder_path):
-                        if f.lower().endswith('.apk'):
-                            apk_found_path = os.path.join(folder_path, f)
-                            break
             
             if apk_found_path:
                 self.sig_log.emit(f"Extracting APK {os.path.basename(apk_found_path)} for {label}...")
@@ -579,20 +603,33 @@ class WorkerThread(QThread):
             
             if compare_path == last_path:
                 self.sig_log.emit(f"Checking existing {label} extraction...")
-                textures = am.load_metadata(temp_path)
-                if textures:
-                    # Ensure save_path and size are present
-                    for t in textures:
-                        if 'file' in t:
-                            t['save_path'] = os.path.join(temp_path, t['file'])
-                        if 'size' not in t:
-                            if os.path.exists(t['save_path']):
-                                t['size'] = os.path.getsize(t['save_path'])
-                            else:
-                                t['size'] = 0
-                    self.sig_log.emit(f"Reusing existing {label} extraction ({len(textures)} items).")
-                    self.sig_progress.emit(prog_start + prog_range, f"{label} reuse complete.")
-                    return textures
+                raw_data = am.load_metadata(temp_path)
+                if raw_data:
+                    # Handle both dict (with results) and list formats
+                    if isinstance(raw_data, dict):
+                        # If it's a match result dict, extract original textures
+                        results = raw_data.get('results', [])
+                        if results and isinstance(results, list) and 'original' in results[0]:
+                            textures = [r['original'] for r in results]
+                        else:
+                            textures = results # Fallback
+                    else:
+                        textures = raw_data
+
+                    if textures and isinstance(textures, list):
+                        # Ensure save_path and size are present
+                        for t in textures:
+                            if isinstance(t, dict):
+                                if 'file' in t:
+                                    t['save_path'] = os.path.join(temp_path, t['file'])
+                                if 'size' not in t:
+                                    if t.get('save_path') and os.path.exists(t['save_path']):
+                                        t['size'] = os.path.getsize(t['save_path'])
+                                    else:
+                                        t['size'] = 0
+                        self.sig_log.emit(f"Reusing existing {label} extraction ({len(textures)} items).")
+                        self.sig_progress.emit(prog_start + prog_range, f"{label} reuse complete.")
+                        return textures
             
             # Otherwise, clear and extract
             self.sig_log.emit(f"Extracting textures from {label} assets...")
@@ -683,17 +720,33 @@ class WorkerThread(QThread):
         self.sig_log.emit("Hashing Modified textures...")
         total_mod = len(mod_textures)
         for i, tex in enumerate(mod_textures):
+            if 'save_path' not in tex:
+                continue
+            if not os.path.exists(tex['save_path']):
+                continue
             if 'hash' not in tex:
-                tex['hash'] = get_image_hash(tex['save_path'])
+                try:
+                    tex['hash'] = get_image_hash(tex['save_path'])
+                except: continue
             if i % 20 == 0:
                 self.sig_progress.emit(int((i/total_mod)*100), f"Hashing Modified {i}/{total_mod}...")
 
         self.sig_log.emit("Matching textures...")
         results = []
         for i, o_tex in enumerate(orig_textures):
-            # if o_tex['name'] == 'HCCG_insert_0007':
-            #     breakpoint()
-            o_tex['hash'] = get_image_hash(o_tex['save_path'])
+            if 'save_path' not in o_tex:
+                self.sig_log.emit(f"Warning: Missing 'save_path' for texture '{o_tex.get('name', 'Unknown')}'. Skipping.")
+                continue
+                
+            if not os.path.exists(o_tex['save_path']):
+                self.sig_log.emit(f"Warning: File not found: {o_tex['save_path']}. Skipping.")
+                continue
+
+            try:
+                o_tex['hash'] = get_image_hash(o_tex['save_path'])
+            except Exception as e:
+                self.sig_log.emit(f"Error hashing {o_tex['save_path']}: {e}")
+                continue
             
             candidate_pool = {} # save_path -> m_tex
             
@@ -748,10 +801,11 @@ class WorkerThread(QThread):
                 results.append({"original": o_tex, "match_file": None, "best_similarity": 0.0, "candidates": [], "replace": False})
                 continue
 
-            # 2. Identify "ABSOLUTE BEST" Candidate using Name/Res/Sim priority from the FILTERED list 
+            # 2. Identify "ABSOLUTE BEST" Candidate using Similarity/Name/Res priority from the FILTERED list 
             def best_sort_key(x):
-                # Priority: name match (is_exact) > resolution match (is_same_res) > high similarity (similarity)
-                return (1 if x['is_exact'] else 0, 1 if x['is_same_res'] else 0, x['similarity'])
+                # Priority: 1.0 Similarity (is_perfect) > name match (is_exact) > resolution match (is_same_res) > high similarity (similarity)
+                is_perfect = (x['similarity'] >= 1.0)
+                return (1 if is_perfect else 0, 1 if x['is_exact'] else 0, 1 if x['is_same_res'] else 0, x['similarity'])
             
             best_candidate = max(final_refined, key=best_sort_key)
             best_match_path = best_candidate['tex']['save_path']
@@ -914,7 +968,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Unity Texture Changer (v2.0)")
+        self.setWindowTitle("Unity Texture Changer")
         # Determine internal resource path (sys._MEIPASS when frozen)
         if getattr(sys, 'frozen', False):
             self.res_dir = sys._MEIPASS
@@ -939,12 +993,15 @@ class MainWindow(QMainWindow):
 
         self.resize(1280, 800)
         self.results = []
+        self.orig_textures = []
+        self.mod_textures = []
         self.worker_thread = None
         self.current_preview_id = 0
         
         # Setup Async Preview Thread
         self.preview_thread = QThread()
         self.preview_worker = PreviewWorker(self)
+        self._active_threads = []
         self.preview_worker.moveToThread(self.preview_thread)
         self.sig_request_preview.connect(self.preview_worker.run_preview)
         self.preview_worker.sig_preview_ready.connect(self.on_preview_ready)
@@ -976,19 +1033,18 @@ class MainWindow(QMainWindow):
             path = urls[0].toLocalFile()
             if os.path.isfile(path) and not path.lower().endswith('.apk'):
                 path = os.path.dirname(path)
+            
+            resolved_path = resolve_apk_path(path)
                 
             if not self.orig_path.text().strip():
-                self.orig_path.setText(path)
-                self.on_path_changed_direct(path)
-                self.log(f"Auto-filled Original Path: {path}")
+                self.orig_path.setText(resolved_path)
+                self.log(f"Auto-filled Original Path: {resolved_path}")
             elif not self.mod_path.text().strip():
-                self.mod_path.setText(path)
-                self.on_path_changed_direct(path)
-                self.log(f"Auto-filled Modified Path: {path}")
+                self.mod_path.setText(resolved_path)
+                self.log(f"Auto-filled Modified Path: {resolved_path}")
             else:
-                self.mod_path.setText(path)
-                self.on_path_changed_direct(path)
-                self.log(f"Overwrote Modified Path: {path}")
+                self.mod_path.setText(resolved_path)
+                self.log(f"Overwrote Modified Path: {resolved_path}")
 
     def closeEvent(self, event):
         """Save metadata and settings on exit."""
@@ -1009,10 +1065,19 @@ class MainWindow(QMainWindow):
         if not textures: return
         changed = False
         for t in textures:
-            # 1. Ensure save_path
-            if 'save_path' not in t and 'file' in t:
-                t['save_path'] = os.path.join(temp_path, t['file'])
+            # 1. Ensure save_path exists
+            if 'save_path' not in t:
+                if 'file' in t:
+                    t['save_path'] = os.path.join(temp_path, t['file'])
+                elif 'name' in t and 'path_id' in t:
+                    # Specific to our safe_name pattern for Unity extractions
+                    t['save_path'] = os.path.join(temp_path, f"{t['name']}_{t['path_id']}.png")
+            
+            if 'save_path' in t:
                 changed = True
+                # Extra: ensure name is correct if missing
+                if 'name' not in t:
+                    t['name'] = os.path.splitext(os.path.basename(t['save_path']))[0]
             
             # 2. Ensure size
             if 'size' not in t:
@@ -1123,8 +1188,8 @@ class MainWindow(QMainWindow):
             # Trigger the visual style update for diff_check
             self.on_diff_toggle(Qt.CheckState.Checked if highlight_diff else Qt.CheckState.Unchecked)
     
-            if mod: self.on_path_changed_direct(mod)
-            if orig: self.on_path_changed_direct(orig)
+            if mod: self.on_path_changed_direct(self.mod_path, mod)
+            if orig: self.on_path_changed_direct(self.orig_path, orig)
         finally:
             self._is_loading = False
 
@@ -1304,66 +1369,43 @@ class MainWindow(QMainWindow):
         
         # Tree for results (Using EnhancedTreeWidget for Space bar support)
         self.tree = EnhancedTreeWidget()
-        self.tree.setColumnCount(8)
+        self.tree.setColumnCount(10)
         self.tree.setHeaderLabels([
-            "Replace", "Name", "Res", "Size", "Similarity", "Match File", "M-Res", "M-Size"
+            "Replace", "Name", "Res", "Size", "Similarity", "Assets", "PathID", "Match File", "M-Res", "M-Size"
         ])
         
-        # --- Frozen Column Setup ---
-        self.frozen_tree = EnhancedTreeWidget(self.tree)
-        self.frozen_tree.setColumnCount(8) # Mirror columns for sorting sync
-        self.frozen_tree.setHeaderLabels([
-            "Replace", "Name", "Res", "Size", "Similarity", "Match File", "M-Res", "M-Size"
-        ])
-        # Initially show Replace (0)
-        self.frozen_indices = [0]
-        for i in range(8):
-            self.frozen_tree.setColumnHidden(i, i not in self.frozen_indices)
-            
-        self.frozen_tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.frozen_tree.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.frozen_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.frozen_tree.setFrameShape(QFrame.Shape.NoFrame)
-        
-        # Sync vertical scroll
-        self.tree.verticalScrollBar().valueChanged.connect(self.frozen_tree.verticalScrollBar().setValue)
-        self.frozen_tree.verticalScrollBar().valueChanged.connect(self.tree.verticalScrollBar().setValue)
-        
-        # Sync column widths
-        self.tree.header().sectionResized.connect(self._sync_column_widths)
-        self.frozen_tree.header().sectionResized.connect(self._sync_column_widths)
-        
-        # Sync sorting
-        self.tree.header().sortIndicatorChanged.connect(
-            lambda idx, order: self.frozen_tree.sortByColumn(idx, order)
-        )
-        
-        # Sync expansion
-        self.tree.itemExpanded.connect(self._sync_frozen_expansion)
-        self.tree.itemCollapsed.connect(self._sync_frozen_collapse)
-        
-        # Sync selection
-        self.tree.itemSelectionChanged.connect(self._sync_frozen_selection)
+        # --- UI Styling ---
+        fixed_height_style = """
+            QTreeView::item { 
+                height: 28px; 
+            }
+            QHeaderView::section {
+                height: 32px;
+            }
+        """
+        self.tree.setStyleSheet(self.tree.styleSheet() + fixed_height_style)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setIndentation(20)
         
         self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.tree.header().setSectionsClickable(True)
-        self.tree.header().setSectionsMovable(False) # Keep columns in order
+        self.tree.header().setSectionsMovable(False) 
         
         # Initial Widths
         replace_width = self.tree.fontMetrics().horizontalAdvance("Replace") + 45
-        name_width = 250 # Default name width
+        name_width = 250 
         self.tree.setColumnWidth(0, replace_width)
         self.tree.setColumnWidth(1, name_width)
-        self.frozen_tree.setColumnWidth(0, replace_width)
-        self.frozen_tree.setColumnWidth(1, name_width)
         
-        # Both should be Interactive as requested
-        for i in self.frozen_indices:
-            self.tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
-            self.frozen_tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+        # All columns are interactive
+        self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.tree.header().setStretchLastSection(False)
         
+        # Set alignment for numeric headers
+        for i in [2, 3, 4, 6, 8, 9]:
+            self.tree.headerItem().setTextAlignment(i, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
         self.tree.installEventFilter(self)
-        self.frozen_tree.show()
         # ---------------------------
         #self.tree.header().sectionClicked.connect(self.on_header_clicked)
         self.tree.itemSelectionChanged.connect(self.on_selection_changed)
@@ -1371,6 +1413,7 @@ class MainWindow(QMainWindow):
         self.tree.sig_delete_items.connect(self.delete_selected_items)
         self.tree.sig_check_all.connect(self.check_all_items)
         self.tree.sig_inverse_all.connect(self.inverse_all_items)
+        self.tree.sig_space_pressed.connect(self.toggle_selected_items)
         self.tree.setSortingEnabled(True)
         tree_area.addWidget(self.tree)
         
@@ -1423,7 +1466,7 @@ class MainWindow(QMainWindow):
                 # Alternatively, self.showMaximized() if window is meant to be full screen
 
     def start_worker(self, task_type, **kwargs):
-        if self.worker_thread:
+        if self.worker_thread and self.worker_thread.isRunning():
             return
             
         self.worker_thread = WorkerThread(task_type, **kwargs)
@@ -1431,6 +1474,10 @@ class MainWindow(QMainWindow):
         self.worker_thread.sig_log.connect(self.log)
         self.worker_thread.sig_error.connect(self.on_worker_error)
         self.worker_thread.sig_finished.connect(self.on_finished)
+        
+        # Ensure thread object is deleted only after it has completely finished
+        self.worker_thread.finished.connect(self.worker_thread.deleteLater)
+        
         self.worker_thread.start()
         self.start_time = time.time()
         self.update_buttons()
@@ -1442,15 +1489,19 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, title, message)
 
     def on_finished(self, data):
-        self.worker_thread = None
-        self.update_buttons()
         # Route to specific handlers based on task type
         if isinstance(data, dict) and 'orig' in data:
             self.on_extraction_finished(data)
         elif isinstance(data, list):
             self.on_matching_finished(data)
+        elif isinstance(data, dict) and 'target_dir' in data:
+            self.on_copy_finished(data)
         elif isinstance(data, dict) and 'success' in data:
             self.on_apply_finished(data)
+            
+        # Safely clear reference after all handlers are done
+        self.worker_thread = None
+        self.update_buttons()
 
     def toggle_log_visibility(self, state):
         # Guard: Prevent UI jumps while background task is running
@@ -1488,61 +1539,81 @@ class MainWindow(QMainWindow):
         return False
 
     def get_engine_type(self, path):
-        if not path or not os.path.exists(path):
-            return "Image"
-            
-        if self.detect_apk(path):
-            return "Unity APK"
-            
-        if not os.path.isdir(path):
-            return "Image"
-            
+        if not path: return "Image"
+        
         try:
-            files = os.listdir(path)
-            files_lower = [f.lower() for f in files]
+            # Handle potential trailing spaces or invalid chars from UI input
+            path = path.strip()
+            if not os.path.exists(path):
+                return "Image"
             
-            # To be Unity mode, it needs a combination of factors:
-            # 1. Has UnityPlayer.dll (Strong sign)
-            # 2. Has GameAssembly.dll (Strong sign for IL2CPP)
-            # 3. Has an .exe AND a *_Data folder (Strong sign for Mono/IL2CPP)
-            
-            has_data_folder = any(f.lower().endswith('_data') and os.path.isdir(os.path.join(path, f)) for f in files)
-            has_exe = any(f.endswith('.exe') for f in files_lower)
-            has_unity_dll = 'unityplayer.dll' in files_lower or 'gameassembly.dll' in files_lower
-            
-            if (has_exe and has_data_folder) or has_unity_dll:
-                return "Unity"
-            
-            # Check for standard asset files in root
-            if any(f.endswith(('.assets', '.unity3d', '.bundle')) for f in files_lower):
-                return "Unity"
-            
-            # Deep check for signatures if not in root (limit depth to 2)
-            for root, dirs, fnames in os.walk(path):
-                fn_lower = [fn.lower() for fn in fnames]
-                if 'gameassembly.dll' in fn_lower or 'unityplayer.dll' in fn_lower:
-                    return "Unity"
-                if any(d.lower().endswith('_data') for d in dirs):
-                    return "Unity"
-                if root.count(os.sep) - path.count(os.sep) >= 2:
-                    del dirs[:]
-        except: pass
+            # 1. If it's a file directly
+            if os.path.isfile(path):
+                if path.lower().endswith('.apk'):
+                    return "Unity APK"
+                return "Image"
+                
+            # 2. If it's a directory, check for PC signatures FIRST
+            # This prevents switching to APK mode just because an APK is in a subfolder
+            if os.path.isdir(path):
+                try:
+                    files = os.listdir(path)
+                    files_lower = [f.lower() for f in files]
+                except Exception:
+                    return "Image"
 
-        # 2. RPGM (MV/MZ)
-        if os.path.exists(os.path.join(path, "www", "data")) or \
-           os.path.exists(os.path.join(path, "data", "Actors.json")):
-            return "RPGM"
-        # 3. RPGM (VX/VX Ace)
-        if any(f.lower().endswith(('.rgss3a', '.rgss2a', '.rgssad')) for f in (os.listdir(path) if os.path.exists(path) else [])):
-            return "RPGM"
-        # 4. KIRIKIRI
-        if any(f.lower().endswith('.xp3') for f in (os.listdir(path) if os.path.exists(path) else [])) or \
-           os.path.exists(os.path.join(path, "data.xp3")):
-            return "KIRIKIRI"
-        # 5. Tyrano
-        if os.path.exists(os.path.join(path, "index.html")) and \
-           (os.path.exists(os.path.join(path, "tyrano")) or os.path.exists(os.path.join(path, "data", "scenario"))):
-            return "Tyrano"
+                # A. Unity PC Detection
+                has_data_folder = any(f.endswith('_data') and os.path.isdir(os.path.join(path, f)) for f in files_lower)
+                has_exe = any(f.endswith('.exe') for f in files_lower)
+                has_unity_dll = 'unityplayer.dll' in files_lower or 'gameassembly.dll' in files_lower
+                
+                if (has_exe and has_data_folder) or has_unity_dll:
+                    return "Unity"
+                
+                # Check for standard asset files in root
+                if any(f.endswith(('.assets', '.unity3d', '.bundle')) for f in files_lower):
+                    return "Unity"
+                
+                # Deep check for Unity signatures
+                try:
+                    for root, dirs, fnames in os.walk(path):
+                        fn_lower = [fn.lower() for fn in fnames]
+                        if 'gameassembly.dll' in fn_lower or 'unityplayer.dll' in fn_lower:
+                            return "Unity"
+                        if any(d.lower().endswith('_data') for d in dirs):
+                            return "Unity"
+                        if root.count(os.sep) - path.count(os.sep) >= 2:
+                            del dirs[:]
+                except: pass
+
+                # B. RPGM (MV/MZ)
+                if os.path.exists(os.path.join(path, "www", "data")) or \
+                   os.path.exists(os.path.join(path, "data", "Actors.json")):
+                    return "RPGM"
+                
+                # C. RPGM (VX/VX Ace)
+                if any(f.endswith(('.rgss3a', '.rgss2a', '.rgssad')) for f in files_lower):
+                    return "RPGM"
+                    
+                # D. KIRIKIRI
+                if any(f.endswith('.xp3') for f in files_lower) or \
+                   os.path.exists(os.path.join(path, "data.xp3")):
+                    return "KIRIKIRI"
+                    
+                # E. Tyrano
+                if os.path.exists(os.path.join(path, "index.html")) and \
+                   (os.path.exists(os.path.join(path, "tyrano")) or os.path.exists(os.path.join(path, "data", "scenario"))):
+                    return "Tyrano"
+
+                # F. Only if NO other engine detected, check for APK in this folder
+                resolved = self.detect_apk(path)
+                if resolved and resolved.lower().endswith('.apk'):
+                    # Important: Check if the 'resolved' path is actually an APK file (not the folder itself)
+                    if os.path.isfile(resolved):
+                        return "Unity APK"
+                
+        except Exception:
+            pass
             
         return "Image"
 
@@ -1559,60 +1630,51 @@ class MainWindow(QMainWindow):
     def on_path_changed(self, _):
         # Auto-detect mode and clear temp if path changed
         sender = self.sender()
-        path = sender.text() if sender else ""
+        path_raw = sender.text() if sender else ""
+        path = path_raw.strip()
         
-        # Only check if it's a valid directory to prevent constant clearing while typing
-        if path and os.path.exists(path):
-            is_loading = getattr(self, '_is_loading', False)
-            if sender == self.orig_path:
-                if not self.is_extracted(path, self.temp_dir_orig):
-                    if not is_loading:
-                        self.check_and_clear_temp(self.temp_dir_orig)
-                        self.results = []
-                        self.tree.clear()
-                        self.update_status_counts()
-            elif sender == self.mod_path:
-                if not self.is_extracted(path, self.temp_dir_mod):
-                    if not is_loading:
-                        self.check_and_clear_temp(self.temp_dir_mod)
-                        self.mod_textures = []
-                        self.results = []
-                        self.tree.clear()
-                        self.update_status_counts()
+        # 1. Validity Check
+        # If the path is empty, we clear results.
+        # If the path is invalid (doesn't exist), we keep the current results/UI 
+        # but don't trigger any new detection or restoration logic.
+        if not path:
+            if not getattr(self, '_is_loading', False):
+                self.results = []
+                self.tree.clear()
+                self.update_status_counts()
+                self.update_buttons()
+            return
 
-        # APK Detection and Mode Selection
-        self.on_path_changed_direct(path)
-        self.auto_detect_apk_mode()
+        if not os.path.exists(path):
+            # Path is being typed or invalid. Do not clear results yet.
+            # This allows user to maintain context while correcting a typo.
+            return
+
+        # 2. Valid Path: Clear and update
+        if not getattr(self, '_is_loading', False):
+            self.results = []
+            self.tree.clear()
+            self.update_status_counts()
+        
+        if sender == self.orig_path:
+            self.orig_textures = []
+            if not self.is_extracted(path, self.temp_dir_orig):
+                self.check_and_clear_temp(self.temp_dir_orig)
+        elif sender == self.mod_path:
+            self.mod_textures = []
+            if not self.is_extracted(path, self.temp_dir_mod):
+                self.check_and_clear_temp(self.temp_dir_mod)
+
+        # 3. Mode Auto-detection
+        self.on_path_changed_direct(sender, path)
 
     def detect_apk(self, path):
         """Checks if a path is an APK or contains an APK."""
-        if not path or not os.path.exists(path): return None
-        if path.lower().endswith('.apk'): return path
-        if os.path.isdir(path):
-            try:
-                for f in os.listdir(path):
-                    if f.lower().endswith('.apk'):
-                        return os.path.join(path, f)
-            except: pass
+        resolved = resolve_apk_path(path)
+        if resolved and resolved.lower().endswith('.apk'):
+            return resolved
         return None
 
-    def auto_detect_apk_mode(self):
-        """Automatically switches to Unity APK mode if an APK is found in orig or mod paths."""
-        orig_path = self.orig_path.text()
-        mod_path = self.mod_path.text()
-        
-        has_apk = self.detect_apk(orig_path) or self.detect_apk(mod_path)
-        
-        if has_apk:
-            if self.mode_combo.currentText() != "Unity APK" or self.mode_combo.isEnabled():
-                self.mode_combo.setCurrentText("Unity APK")
-                self.mode_combo.setEnabled(False)
-                self.log(f"APK detected. Switching to 'Unity APK' mode (Read-only).")
-        else:
-            # Re-enable if it was locked
-            if not self.mode_combo.isEnabled() and self.mode_combo.currentText() == "Unity APK":
-                self.mode_combo.setEnabled(True)
-                self.log("No APK detected. Mode selection re-enabled.")
                     
     def check_and_clear_temp(self, temp_path):
         """Clears the temp folder if it contains files from a previous extraction."""
@@ -1632,62 +1694,38 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     self.log(f"Failed to clear {temp_path}: {e}")
 
-    def on_path_changed_direct(self, path):
+    def on_path_changed_direct(self, sender, path):
         if not path: return
-        engine = self.get_engine_type(path)
-        if engine != "Image":
-            self.mode_combo.setCurrentText(engine)
-        else:
-            self.mode_combo.setCurrentText("Image")
         
-        # Try to auto-restore results if both paths are set
-        if self.orig_path.text() and self.mod_path.text():
-            self.restore_matching_results()
+        # Safety: Path must exist before we try to detect engines or restore results
+        if not os.path.exists(path.strip()):
+            return
+            
+        try:
+            # Auto-update Mode ONLY when Original path changes
+            if sender == self.orig_path:
+                engine = self.get_engine_type(path)
+                self.mode_combo.setCurrentText(engine)
+                
+                # Lock/Unlock mode combo based on detection
+                # We lock it for Unity APK mode because it requires specific extraction/repack logic
+                is_apk = (engine == "Unity APK")
+                self.mode_combo.setEnabled(not is_apk)
+                if is_apk:
+                    self.log(f"APK detected. Switching to 'Unity APK' mode (Read-only).")
+                elif not self.mode_combo.isEnabled():
+                    self.mode_combo.setEnabled(True)
+                    self.log(f"Switched to {engine} mode. Mode selection re-enabled.")
+            
+            # Try to auto-restore results if both paths are set
+            if self.orig_path.text() and self.mod_path.text():
+                # restore_matching_results internally calls update_tree()
+                self.restore_matching_results()
+        except Exception as e:
+            self.log(f"Error handling path change: {e}")
             
         self.update_buttons()
 
-    def on_apply_finished(self, summary):
-        self.update_buttons(is_finishing=True)
-        if 'successful_paths' in summary:
-            self._mark_items_as_replaced(summary['successful_paths'])
-        self._sync_metadata_to_disk()
-        self.log(f"Apply finished: {summary}")
-        QMessageBox.information(self, "Finished", f"Successfully applied {summary['success']} textures.")
-
-    def _mark_items_as_replaced(self, successful_paths):
-        """Updates internal results and UI tree after successful replacement."""
-        if not successful_paths: return
-        paths_set = set(successful_paths)
-        changed = False
-        
-        # 1. Update self.results
-        for res in self.results:
-            if res['original']['save_path'] in paths_set:
-                res['best_similarity'] = 1.0
-                res['replace'] = False # Uncheck after success
-                # Update candidates similarity too if match_file is found
-                for cand in res.get('candidates', []):
-                    if cand['save_path'] == res.get('match_file'):
-                        cand['similarity'] = 1.0
-                changed = True
-        
-        if changed:
-            # 2. Update UI Tree
-            self.tree.blockSignals(True)
-            for i in range(self.tree.topLevelItemCount()):
-                item = self.tree.topLevelItem(i)
-                res = item.data(1, Qt.ItemDataRole.UserRole)
-                if res['original']['save_path'] in paths_set:
-                    # Update similarity text (Column 4)
-                    item.setText(4, "100.0%")
-                    # Uncheck
-                    item.setCheckState(0, Qt.CheckState.Unchecked)
-                    item.setData(0, Qt.ItemDataRole.UserRole, False)
-            self.tree.blockSignals(False)
-            
-            self.update_status_counts()
-            self.update_copy_button_state()
-            self.tree.viewport().update()
 
     def on_mode_changed(self, mode):
         # Enable Packer only for Unity mode
@@ -1702,8 +1740,7 @@ class MainWindow(QMainWindow):
     def browse_folder(self, line_edit):
         path = QFileDialog.getExistingDirectory(self, "Select Folder")
         if path:
-            line_edit.setText(path)
-            self.on_path_changed_direct(path)
+            line_edit.setText(resolve_apk_path(path))
 
     def extract(self):
         orig = self.orig_path.text()
@@ -1731,53 +1768,201 @@ class MainWindow(QMainWindow):
         self.log(f"Extraction complete. {len(self.orig_textures)} Original, {len(self.mod_textures)} Modified.")
         if not self.orig_textures or not self.mod_textures:
             self.log("Warning: One or both texture lists are empty. 'Match' will be disabled.")
+            QMessageBox.warning(self, "Extraction Issue", 
+                              "No Unity assets or images were found in one of the selected folders.\n\n"
+                              "If this is a Unity APK, ensure it's a valid build. "
+                              "If it's a folder, ensure it contains .assets or .png files.")
         elif self.btn_match.isEnabled():
             self.log("Auto-starting Match...")
             self.match()
 
     def restore_matching_results(self):
         """Tries to load existing matching results from metadata.json."""
+        orig_path = self.orig_path.text()
+        mod_path = self.mod_path.text()
+        
+        if not orig_path or not self.is_extracted(orig_path, self.temp_dir_orig):
+            return False
+            
         if not self.temp_dir_orig or not os.path.exists(self.temp_dir_orig):
-            return
+            return False
             
         metadata_path = os.path.join(self.temp_dir_orig, "metadata.json")
         if not os.path.exists(metadata_path):
-            return
+            return False
 
         am = self.get_asset_manager()
         loaded_metadata = am.load_metadata(self.temp_dir_orig)
-        if loaded_metadata and isinstance(loaded_metadata, list) and len(loaded_metadata) > 0:
+        if not loaded_metadata:
+            return False
+            
+        results_to_load = None
+        
+        # New format: Dict with path validation
+        if isinstance(loaded_metadata, dict):
+            saved_orig = loaded_metadata.get("orig_path", "")
+            saved_mod = loaded_metadata.get("mod_path", "")
+            
+            # Normalize for comparison (Windows case-insensitivity)
+            curr_orig = os.path.normcase(os.path.normpath(orig_path))
+            curr_mod = os.path.normcase(os.path.normpath(mod_path))
+            
+            saved_orig_norm = os.path.normcase(os.path.normpath(saved_orig))
+            saved_mod_norm = os.path.normcase(os.path.normpath(saved_mod))
+            
+            if saved_orig_norm == curr_orig and saved_mod_norm == curr_mod:
+                results_to_load = loaded_metadata.get("results")
+            else:
+                # Path mismatch - do not restore matching results
+                if "results" not in loaded_metadata:
+                    pass 
+                else:
+                    self.log(f"Previous matching results skipped (Path mismatch).")
+                    self.log(f"  Current: {curr_orig} | {curr_mod}")
+                    self.log(f"  Saved:   {saved_orig_norm} | {saved_mod_norm}")
+                    return False
+        
+        # Old format: List
+        elif isinstance(loaded_metadata, list) and len(loaded_metadata) > 0:
             first = loaded_metadata[0]
             if isinstance(first, dict) and 'original' in first and 'candidates' in first:
-                self.results = loaded_metadata
-                self.update_tree()
-                # Sort by Name (Column 1) Ascending by default
-                self.tree.sortByColumn(1, Qt.SortOrder.AscendingOrder)
-                self.log("Restored previous matching results and checkbox states from metadata.json.")
-                # Reset progress bar once restoration and tree building are complete
-                self.progress_bar.setValue(0)
-                self.update_status_counts(is_initial=True) # Ensure label says "Matching complete"
-                self.update_uabea_auto_check() # Check for duplicates in restored checked items
-                return True
+                # It's matching results in old format
+                # We can't validate mod_path here, so we'll just load it (legacy support)
+                results_to_load = loaded_metadata
             else:
                 # It's just extraction metadata
                 self.orig_textures = loaded_metadata
                 self.log("Auto-loaded extraction metadata from metadata.json.")
+                return False
+
+        if results_to_load:
+            self.results = results_to_load
+            
+            # Restore apk_info if present in metadata, or reconstruct it for APK mode
+            if isinstance(loaded_metadata, dict) and "apk_info" in loaded_metadata:
+                self.apk_info = loaded_metadata["apk_info"]
+            elif self.mode_combo.currentText() == "Unity APK":
+                # Fallback: Reconstruct from last_extract settings
+                settings = QSettings("config.ini", QSettings.Format.IniFormat)
+                last_orig = settings.value("last_extract/original", "")
+                if last_orig and last_orig.lower().endswith('.apk'):
+                    self.apk_info = {last_orig: os.path.join(self.temp_dir_orig, "apk_contents")}
+            
+            # Populate orig_textures and mod_textures from results/disk for consistency
+            if self.results and not getattr(self, 'orig_textures', None):
+                self.orig_textures = [res['original'] for res in self.results]
+            
+            if not getattr(self, 'mod_textures', None) and self.mod_path.text():
+                am = self.get_asset_manager()
+                raw_mod = am.load_metadata(self.temp_dir_mod)
+                if raw_mod:
+                    if isinstance(raw_mod, dict):
+                        # Handle new dict format (check for results or list)
+                        self.mod_textures = raw_mod.get('results', [])
+                        if not self.mod_textures and isinstance(raw_mod, list): # Fallback
+                             self.mod_textures = raw_mod
+                    else:
+                        self.mod_textures = raw_mod
+                    
+                    if self.mod_textures:
+                        # Ensure basic normalization
+                        self._normalize_textures(self.mod_textures, self.temp_dir_mod)
+                        self.log(f"Auto-loaded {len(self.mod_textures)} modified textures from disk for matching updates.")
+
+            self.update_tree()
+            # Sort by Name (Column 1) Ascending by default
+            self.tree.sortByColumn(1, Qt.SortOrder.AscendingOrder)
+            self.log("Restored previous matching results and checkbox states from metadata.json.")
+            # Reset progress bar once restoration and tree building are complete
+            self.progress_bar.setValue(0)
+            self.update_status_counts(is_initial=True) # Ensure label says "Matching complete"
+            self.update_uabea_auto_check() # Check for duplicates in restored checked items
+            return True
+            
         return False
+
+    def _sync_metadata_to_disk(self):
+        """Saves current results and texture hashes to metadata.json in the respective temp folders."""
+        if not self.results or not self.temp_dir_orig:
+            return
+            
+        # 1. Sync Original Results (results and orig_textures hashes)
+        metadata = {
+            "orig_path": self.orig_path.text(),
+            "mod_path": self.mod_path.text(),
+            "apk_info": getattr(self, 'apk_info', {}),
+            "results": self.results
+        }
+        
+        am = self.get_asset_manager()
+        am.save_metadata(metadata, self.temp_dir_orig)
+        
+        # 2. Sync Modified Textures (mod_textures pool and hashes)
+        # This prevents re-hashing thousands of mod images on next restart or update
+        if getattr(self, 'mod_textures', None) and self.temp_dir_mod:
+            # We save the full mod_textures list which now includes 'hash' fields
+            am.save_metadata(self.mod_textures, self.temp_dir_mod)
+            
+        self.log("Synchronized matching results and texture hashes to metadata.json.")
 
     def match(self):
         # Fallback: If in Image mode and textures are missing, scan folders directly
         is_image_mode = self.mode_combo.currentText() == "Image"
         
+        am = self.get_asset_manager()
         if not hasattr(self, 'orig_textures') or not self.orig_textures:
-            self.orig_textures = self.get_asset_manager().load_metadata(self.temp_dir_orig) or []
+            self.orig_textures = []
+            raw_data = am.load_metadata(self.temp_dir_orig) or []
+            
+            if isinstance(raw_data, dict):
+                # New format: Dict
+                results = raw_data.get('results', [])
+                if results and isinstance(results, list) and 'original' in results[0]:
+                    self.orig_textures = [r['original'] for r in results]
+                else:
+                    self.orig_textures = results # Fallback
+            elif isinstance(raw_data, list) and len(raw_data) > 0:
+                # Old format: List
+                if isinstance(raw_data[0], dict) and 'original' in raw_data[0]:
+                    self.orig_textures = [r['original'] for r in raw_data]
+                else:
+                    self.orig_textures = raw_data
+            
             if not self.orig_textures:
-                self.orig_textures = self.scan_image_folder(self.orig_path.text())
+                # Fallback: Scan folder for images
+                orig_path = self.orig_path.text()
+                if self.mode_combo.currentText() == "Unity APK":
+                    apk_dir = os.path.join(self.temp_dir_orig, "apk_contents")
+                    if os.path.exists(apk_dir): orig_path = apk_dir
+                self.orig_textures = self.scan_image_folder(orig_path)
+            
+            # Save these paths to config.ini so restore_matching_results recognizes them on next start
+            settings = QSettings("config.ini", QSettings.Format.IniFormat)
+            settings.setValue("last_extract/original", self.orig_path.text())
+            settings.sync()
                 
         if not hasattr(self, 'mod_textures') or not self.mod_textures:
-            self.mod_textures = self.get_asset_manager().load_metadata(self.temp_dir_mod) or []
+            self.mod_textures = []
+            raw_data = am.load_metadata(self.temp_dir_mod) or []
+            
+            if isinstance(raw_data, dict):
+                results = raw_data.get('results', [])
+                if results and isinstance(results, list) and 'original' in results[0]:
+                    self.mod_textures = [r['original'] for r in results]
+                else:
+                    self.mod_textures = results
+            elif isinstance(raw_data, list) and len(raw_data) > 0:
+                if isinstance(raw_data[0], dict) and 'original' in raw_data[0]:
+                    self.mod_textures = [r['original'] for r in raw_data]
+                else:
+                    self.mod_textures = raw_data
+                    
             if not self.mod_textures:
-                self.mod_textures = self.scan_image_folder(self.mod_path.text())
+                mod_path = self.mod_path.text()
+                if self.mode_combo.currentText() == "Unity APK":
+                    apk_dir = os.path.join(self.temp_dir_mod, "apk_contents")
+                    if os.path.exists(apk_dir): mod_path = apk_dir
+                self.mod_textures = self.scan_image_folder(mod_path)
             
         if not self.orig_textures or not self.mod_textures:
             msg = "Extraction metadata missing. Please Extract first."
@@ -1912,13 +2097,9 @@ class MainWindow(QMainWindow):
         sort_order = header.sortIndicatorOrder()
         
         self.tree.setUpdatesEnabled(False)
-        self.frozen_tree.setUpdatesEnabled(False)
         self.tree.setSortingEnabled(False)
-        self.frozen_tree.setSortingEnabled(False)
         self.tree.blockSignals(True)
-        self.frozen_tree.blockSignals(True)
         self.tree.clear()
-        self.frozen_tree.clear()
         
         import time
         start_update = time.time()
@@ -1946,32 +2127,34 @@ class MainWindow(QMainWindow):
             orig = res['original']
             # Parent item
             item = SortableTreeWidgetItem()
-            f_item = SortableTreeWidgetItem(self.frozen_tree)
-            # Link items bi-directionally using UserRole+5
-            item.setData(0, Qt.ItemDataRole.UserRole + 5, f_item)
-            f_item.setData(0, Qt.ItemDataRole.UserRole + 5, item)
-
+            
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            f_item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             
             # Original Replace Checkbox state
             is_replace = res.get('replace', True)
             item.setCheckState(0, Qt.CheckState.Checked if is_replace else Qt.CheckState.Unchecked)
             item.setData(0, Qt.ItemDataRole.UserRole, is_replace)
-            f_item.setCheckState(0, item.checkState(0))
-            f_item.setData(0, Qt.ItemDataRole.UserRole, is_replace)
             
             item.setText(1, orig.get('name', 'Unknown'))
-            f_item.setText(1, item.text(1))
             item.setText(2, f"{orig.get('width', 0)}x{orig.get('height', 0)}")
-            f_item.setText(2, item.text(2))
             item.setText(3, f"{orig.get('size', 0)/1024:.1f} KB")
-            f_item.setText(3, item.text(3))
+
+            # Assets (5) and PathID (6)
+            s_asset = orig.get('source_asset', '')
+            if s_asset:
+                item.setText(5, os.path.basename(s_asset))
+            
+            p_id = orig.get('path_id', '')
+            if p_id is not None and p_id != '':
+                item.setText(6, str(p_id))
+
+            # Right-align numeric columns (Original)
+            for col in [2, 3, 4, 6]:
+                item.setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
             # Store the result object and its original index
             item.setData(1, Qt.ItemDataRole.UserRole, res)
             item.setData(2, Qt.ItemDataRole.UserRole, i)
-            f_item.setData(1, Qt.ItemDataRole.UserRole, res)
-            f_item.setData(2, Qt.ItemDataRole.UserRole, i)
             
             # If we have a match file, update the columns
             if res.get('match_file'):
@@ -2000,29 +2183,23 @@ class MainWindow(QMainWindow):
                 for cand in sorted_candidates:
                     c_sim = cand['similarity']
                     c_item = SortableTreeWidgetItem(item)
-                    cf_item = SortableTreeWidgetItem(f_item)
-                    # Link items bi-directionally
-                    c_item.setData(0, Qt.ItemDataRole.UserRole + 5, cf_item)
-                    cf_item.setData(0, Qt.ItemDataRole.UserRole + 5, c_item)
 
                     c_item.setFlags(c_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                    cf_item.setFlags(cf_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     
                     # Exclusive Checkbox for candidate
                     is_this_match = (res.get('match_file') == cand['save_path'])
                     c_item.setCheckState(0, Qt.CheckState.Checked if is_this_match else Qt.CheckState.Unchecked)
                     c_item.setData(0, Qt.ItemDataRole.UserRole, is_this_match)
-                    cf_item.setCheckState(0, c_item.checkState(0))
-                    cf_item.setData(0, Qt.ItemDataRole.UserRole, is_this_match)
                     
                     c_item.setText(1, cand.get('name', 'Unknown'))
-                    cf_item.setText(1, c_item.text(1))
                     c_item.setText(2, f"{cand.get('width', 0)}x{cand.get('height', 0)}")
-                    cf_item.setText(2, c_item.text(2))
                     c_item.setText(3, f"{cand.get('size', 0)/1024:.1f} KB")
-                    cf_item.setText(3, c_item.text(3))
                     c_item.setText(4, f"{c_sim:.4f}")
-                    cf_item.setText(4, c_item.text(4))
+
+                    # Right-align numeric columns (Candidate)
+                    for col in [2, 3, 4]:
+                        c_item.setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
                     # Change: cand is already in a simplified format
                     c_item.setData(1, Qt.ItemDataRole.UserRole, cand)
 
@@ -2030,7 +2207,6 @@ class MainWindow(QMainWindow):
                     green_brush = Qt.GlobalColor.green
                     if cand.get('name') == orig.get('name'):
                         c_item.setBackground(1, green_brush)
-                        cf_item.setBackground(1, green_brush)
                     if cand.get('width') == orig.get('width') and cand.get('height') == orig.get('height'):
                         c_item.setBackground(2, green_brush)
                     if cand.get('size') == orig.get('size'):
@@ -2040,21 +2216,31 @@ class MainWindow(QMainWindow):
 
         self.tree.addTopLevelItems(all_top_items)
         self.tree.blockSignals(False)
-        self.frozen_tree.blockSignals(False)
+        
+        # Dynamic Column Visibility for Assets/PathID (5, 6)
+        is_unity = (self.mode_combo.currentText() in ("Unity", "Unity APK"))
+        self.tree.setColumnHidden(5, not is_unity)
+        self.tree.setColumnHidden(6, not is_unity)
         
         # Restore sort state
         self.tree.setSortingEnabled(True)
         self.tree.sortByColumn(sort_col, sort_order)
-        self.frozen_tree.setSortingEnabled(True)
-        self.frozen_tree.sortByColumn(sort_col, sort_order)
         
         self.tree.setUpdatesEnabled(True)
-        self.frozen_tree.setUpdatesEnabled(True)
         self.update_status_counts()
         self.update_buttons()
         # Reset progress bar after tree construction is fully finished
         if show_progress:
             self.progress_bar.setValue(0)
+            
+        # Ensure all content is visible by resizing columns to their contents
+        # We block signals to prevent redundant updates during resizing
+        self._is_syncing_widths = True
+        try:
+            for i in range(self.tree.columnCount()):
+                self.tree.resizeColumnToContents(i)
+        finally:
+            self._is_syncing_widths = False
 
     def _update_item_match_cols(self, item, match_tex, similarity):
         res_data = item.data(1, Qt.ItemDataRole.UserRole)
@@ -2062,29 +2248,35 @@ class MainWindow(QMainWindow):
         sim = similarity
         
         item.setText(4, f"{sim:.4f}")
-        item.setText(5, os.path.basename(match_tex.get('save_path', 'Unknown')))
-        item.setText(6, f"{match_tex.get('width', 0)}x{match_tex.get('height', 0)}")
-        item.setText(7, f"{match_tex.get('size', 0)/1024:.1f} KB")
+        item.setText(7, os.path.basename(match_tex.get('save_path', 'Unknown')))
+        item.setText(8, f"{match_tex.get('width', 0)}x{match_tex.get('height', 0)}")
+        item.setText(9, f"{match_tex.get('size', 0)/1024:.1f} KB")
+
+        # Right-align numeric columns (Match update)
+        # 4: Similarity, 6: PathID, 8: M-Res, 9: M-Size
+        for col in [4, 6, 8, 9]:
+            item.setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         # Green highlighting for parent MATCH columns if matching ORIGINAL
         green_brush = Qt.GlobalColor.green
-        # Column 5 (Match File) vs Column 1 (Original Name)
+        
+        # Column 7 (Match Name) vs Column 1 (Original Name)
         m_name = match_tex.get('name', '')
         o_name = orig.get('name', '')
         if m_name and o_name and m_name == o_name:
-            item.setBackground(5, green_brush)
+            item.setBackground(7, green_brush)
         else:
-            item.setData(5, Qt.ItemDataRole.BackgroundRole, None)
-
-        # Column 6 (M-Res) vs Column 2 (Original Res)
+            item.setBackground(7, Qt.GlobalColor.transparent)
+        
+        # Column 8 (M-Res) vs Column 2 (Original Res)
         m_w, m_h = match_tex.get('width', 0), match_tex.get('height', 0)
         o_w, o_h = orig.get('width', 0), orig.get('height', 0)
         if m_w == o_w and m_h == o_h and m_w > 0:
-            item.setBackground(6, green_brush)
+            item.setBackground(8, green_brush)
         else:
-            item.setData(6, Qt.ItemDataRole.BackgroundRole, None)
-
-        # Column 7 (M-Size) vs Column 3 (Original Size)
+            item.setBackground(8, Qt.GlobalColor.transparent)
+            
+        # Column 9 (M-Size) vs Column 3 (Original Size)
         m_size = match_tex.get('size', 0)
         o_size = orig.get('size', 0)
         if m_size == o_size and m_size > 0:
@@ -2100,21 +2292,6 @@ class MainWindow(QMainWindow):
         if column != 0: return
         is_checked = (item.checkState(0) == Qt.CheckState.Checked)
         
-        # Sync between main and frozen tree
-        if item.treeWidget() == self.frozen_tree:
-            # Finding the main item to sync back
-            main_item = item.data(0, Qt.ItemDataRole.UserRole + 5)
-            if main_item:
-                self.tree.blockSignals(True)
-                main_item.setCheckState(0, item.checkState(0))
-                self.tree.blockSignals(False)
-        elif item.treeWidget() == self.tree:
-            f_item = item.data(0, Qt.ItemDataRole.UserRole + 5)
-            if f_item:
-                self.frozen_tree.blockSignals(True)
-                f_item.setCheckState(0, item.checkState(0))
-                self.frozen_tree.blockSignals(False)
-
         parent = item.parent()
         if parent:
             # Child Item (Candidate)
@@ -2321,37 +2498,83 @@ class MainWindow(QMainWindow):
         finally:
             self._is_deleting = False
 
-    def _sync_metadata_to_disk(self):
-        """Synchronizes current results back to metadata.json on disk."""
-        if not hasattr(self, 'temp_dir_orig') or not self.temp_dir_orig or not self.results:
-            return
-            
-        # Strip hashes before saving
-        clean_results = self._strip_metadata(self.results)
+    def toggle_selected_items(self):
+        selected = self.tree.selectedItems()
+        if not selected: return
         
-        # Atomic write to prevent 0-byte file on crash/error
-        metadata_path = os.path.join(self.temp_dir_orig, "metadata.json")
-        temp_path = metadata_path + ".tmp"
-        try:
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(clean_results, f, ensure_ascii=False, indent=2)
-            
-            # Use os.replace for atomic replacement of metadata.json
-            if os.path.exists(temp_path):
-                os.replace(temp_path, metadata_path)
-        except Exception as e:
-            self.log(f"Failed to save persistent metadata: {e}")
-            if os.path.exists(temp_path):
-                try: os.remove(temp_path)
-                except: pass
-
-    def _strip_metadata(self, data):
-        """Recursively removes 'hash' keys from metadata for storage."""
-        if isinstance(data, list):
-            return [self._strip_metadata(item) for item in data]
-        if isinstance(data, dict):
-            return {k: self._strip_metadata(v) for k, v in data.items() if k != 'hash'}
-        return data
+        self.tree.blockSignals(True)
+        
+        changed = False
+        first_item = selected[0]
+        
+        if first_item.parent():
+            # Candidates: Always check
+            new_state_for_parents = Qt.CheckState.Checked
+        else:
+            # Originals: Toggle
+            first_state = first_item.checkState(0)
+            new_state_for_parents = Qt.CheckState.Checked if first_state == Qt.CheckState.Unchecked else Qt.CheckState.Unchecked
+        
+        for item in selected:
+            if item.parent():
+                # Candidates
+                if item.checkState(0) != Qt.CheckState.Checked:
+                    # We need to replicate on_item_changed logic for candidates
+                    parent = item.parent()
+                    # Uncheck siblings
+                    for idx in range(parent.childCount()):
+                        child = parent.child(idx)
+                        if child != item:
+                            child.setCheckState(0, Qt.CheckState.Unchecked)
+                            child.setData(0, Qt.ItemDataRole.UserRole, False)
+                    
+                    item.setCheckState(0, Qt.CheckState.Checked)
+                    item.setData(0, Qt.ItemDataRole.UserRole, True)
+                    
+                    # Update data
+                    cand = item.data(1, Qt.ItemDataRole.UserRole)
+                    parent_idx = parent.data(2, Qt.ItemDataRole.UserRole)
+                    if parent_idx is not None:
+                        self.results[parent_idx]['match_file'] = cand['save_path']
+                        self.results[parent_idx]['best_similarity'] = cand['similarity']
+                        self.results[parent_idx]['replace'] = True
+                        
+                        # Ensure parent is checked
+                        parent.setCheckState(0, Qt.CheckState.Checked)
+                        parent.setData(0, Qt.ItemDataRole.UserRole, True)
+                            
+                        # Update parent columns
+                        m_tex = {
+                            "save_path": cand['save_path'],
+                            "name": cand['name'],
+                            "width": cand['width'],
+                            "height": cand['height'],
+                            "size": cand['size']
+                        }
+                        self._update_item_match_cols(parent, m_tex, cand['similarity'])
+                    changed = True
+            else:
+                # Originals
+                if item.checkState(0) != new_state_for_parents:
+                    item.setCheckState(0, new_state_for_parents)
+                    is_checked = (new_state_for_parents == Qt.CheckState.Checked)
+                    item.setData(0, Qt.ItemDataRole.UserRole, is_checked)
+                    
+                    idx = item.data(2, Qt.ItemDataRole.UserRole)
+                    if idx is not None:
+                        self.results[idx]['replace'] = is_checked
+                    changed = True
+        
+        self.tree.blockSignals(False)
+        
+        if changed:
+            self.update_buttons()
+            self.update_status_counts()
+            self.update_copy_button_state()
+            self.update_uabea_auto_check()
+            self.tree.viewport().update()
+            if self.tree.sortColumn() == 0:
+                self.tree.sortItems(0, self.tree.header().sortIndicatorOrder())
 
     def check_all_items(self, checked):
         changed = False
@@ -2388,7 +2611,7 @@ class MainWindow(QMainWindow):
             new_state = Qt.CheckState.Unchecked if is_checked else Qt.CheckState.Checked
             item.setCheckState(0, new_state)
             item.setData(0, Qt.ItemDataRole.UserRole, not is_checked)
-            
+                
             idx = item.data(2, Qt.ItemDataRole.UserRole)
             if idx is not None and 0 <= idx < len(self.results):
                 self.results[idx]['replace'] = not is_checked
@@ -2484,6 +2707,9 @@ class MainWindow(QMainWindow):
         
         self.comp_widget.matched_label.set_image(pix2)
         
+        # 3. Restore Viewport (Using singleShot to ensure scrollbars have updated ranges)
+        QTimer.singleShot(0, lambda: self.comp_widget.set_scroll_normalized(self.last_viewport[0], self.last_viewport[1]))
+        
         # Update IDs
         self.comp_widget.current_img1_path = path1
         self.comp_widget.current_img2_path = path2
@@ -2492,6 +2718,10 @@ class MainWindow(QMainWindow):
         if not orig_tex: return
         path1 = orig_tex['save_path']
         path2 = match_tex['save_path'] if match_tex else None
+        
+        # Viewport preservation: Don't reset if we want to maintain zoom/scroll across items
+        # if path1 != self.comp_widget.current_img1_path or path2 != self.comp_widget.current_img2_path:
+        #     self.last_viewport = (0, 0, 1, 1)
         
         # Show loading indicator in comparison view
         self.comp_widget.set_loading(True)
@@ -2505,57 +2735,8 @@ class MainWindow(QMainWindow):
         if self.current_orig_img:
             self.draw_thumbnail_viewport()
 
-    # --- Frozen Column Helpers ---
-    def _sync_frozen_expansion(self, item):
-        f_item = item.data(0, Qt.ItemDataRole.UserRole + 5)
-        if f_item: f_item.setExpanded(True)
-
-    def _sync_frozen_collapse(self, item):
-        f_item = item.data(0, Qt.ItemDataRole.UserRole + 5)
-        if f_item: f_item.setExpanded(False)
-
-    def _sync_frozen_selection(self):
-        if not hasattr(self, 'frozen_tree'): return
-        self.frozen_tree.blockSignals(True)
-        self.frozen_tree.clearSelection()
-        for item in self.tree.selectedItems():
-            f_item = item.data(0, Qt.ItemDataRole.UserRole + 5)
-            if f_item:
-                f_item.setSelected(True)
-        self.frozen_tree.blockSignals(False)
-
     def eventFilter(self, obj, event):
-        if obj == self.tree and event.type() == QEvent.Type.Resize:
-            self.update_frozen_geometry()
         return super().eventFilter(obj, event)
-
-    def update_frozen_geometry(self):
-        if not hasattr(self, 'frozen_tree'): return
-        # Position frozen tree to cover all frozen columns
-        fw = self.tree.frameWidth()
-        total_frozen_width = 0
-        for i in self.frozen_indices:
-            total_frozen_width += self.tree.columnWidth(i)
-            
-        self.frozen_tree.setGeometry(
-            fw, 
-            fw, 
-            total_frozen_width, 
-            self.tree.height() - 2*fw
-        )
-
-    def _sync_column_widths(self, index, old_size, new_size):
-        if getattr(self, '_is_syncing_widths', False): return
-        self._is_syncing_widths = True
-        try:
-            sender = self.sender()
-            target = self.frozen_tree.header() if sender == self.tree.header() else self.tree.header()
-            if target.sectionSize(index) != new_size:
-                target.resizeSection(index, new_size)
-            if index in self.frozen_indices:
-                self.update_frozen_geometry()
-        finally:
-            self._is_syncing_widths = False
 
     def _update_thumbnail_size(self):
         if not hasattr(self, 'current_pix') or self.current_pix is None or self.current_pix.isNull():
@@ -2654,34 +2835,48 @@ class MainWindow(QMainWindow):
             self.update_status_counts()
             self.update_copy_button_state()
 
-    def is_extracted(self, folder_path, temp_path):
-        if not folder_path or not os.path.exists(folder_path):
+    def is_extracted(self, path, temp_path):
+        """Checks if a folder is already successfully extracted for the given path."""
+        if not path or not os.path.exists(path):
             return False
-        
+            
+        # Compare with the last successfully extracted path from config.ini
         settings = QSettings("config.ini", QSettings.Format.IniFormat)
-        last_path = settings.value(f"last_extract/{'original' if temp_path == self.temp_dir_orig else 'modified'}", "")
+        label = "original" if temp_path == self.temp_dir_orig else "modified"
+        last_path = settings.value(f"last_extract/{label}", "")
         
-        # In APK mode, we might be comparing the folder to the stored APK path or vice versa.
-        # Normalize comparison:
-        compare_path = self.detect_apk(folder_path) or folder_path
+        if not last_path:
+            return False
+
+        # APK Mode logic: In APK mode, the UI path might be a folder containing the APK, 
+        # but 'last_path' in config.ini is the path to the APK file itself.
+        compare_path = path
+        if self.mode_combo.currentText() == "Unity APK":
+            apk_path = self.detect_apk(path)
+            if apk_path:
+                compare_path = apk_path
         
-        # Normcase for Windows path comparison
-        if os.path.normcase(os.path.normpath(compare_path)) != os.path.normcase(os.path.normpath(last_path)):
+        # Normalize for accurate comparison (Windows case-insensitivity)
+        if os.path.normcase(os.path.normpath(last_path)) != os.path.normcase(os.path.normpath(compare_path)):
+            return False
+            
+        if not os.path.exists(temp_path) or not os.listdir(temp_path):
             return False
             
         metadata_path = os.path.join(temp_path, "metadata.json")
-        if not os.path.exists(metadata_path):
-            return False
-            
-        # Also check if directory is not empty
-        if not os.listdir(temp_path):
-            return False
-            
-        return True
+        return os.path.exists(metadata_path)
 
     def update_buttons(self, is_finishing=False):
         # Determine if any background task is running
-        is_running = not is_finishing and self.worker_thread is not None and self.worker_thread.isRunning()
+        # Safe check for worker thread status
+        is_running = False
+        if not is_finishing and self.worker_thread is not None:
+            try:
+                is_running = self.worker_thread.isRunning()
+            except (RuntimeError, AttributeError):
+                # Object was already deleted by Qt's event loop
+                self.worker_thread = None
+                is_running = False
         
         # 1. Clear button
         has_temp_files = False
@@ -2781,7 +2976,12 @@ class MainWindow(QMainWindow):
             self.tree.clear()
             self.update_status_counts()
             
-            self.log("Temporary folders cleared and result list reset.")
+            # Clear last_extract settings to force fresh extraction on next attempt
+            settings = QSettings("config.ini", QSettings.Format.IniFormat)
+            settings.remove("last_extract")
+            settings.sync()
+            
+            self.log("Temporary folders cleared, settings reset, and result list reset.")
             self.update_buttons()
             
     def on_diff_toggle(self, state):
@@ -2813,8 +3013,20 @@ class MainWindow(QMainWindow):
 
     def on_copy_finished(self, summary):
         self.update_buttons(is_finishing=True)
-        if 'successful_paths' in summary:
+        
+        # Only update the list (Similarity 1.0, Uncheck) if the target directory is the SAME as the original folder.
+        # If orig_path is a file (APK), compare target_dir to the file's parent directory.
+        target_dir = os.path.normcase(os.path.normpath(summary.get('target_dir', '')))
+        orig_raw = self.orig_path.text()
+        if os.path.isfile(orig_raw):
+            orig_folder = os.path.dirname(orig_raw)
+        else:
+            orig_folder = orig_raw
+        orig_folder = os.path.normcase(os.path.normpath(orig_folder))
+        
+        if target_dir == orig_folder and 'successful_paths' in summary:
             self._mark_items_as_replaced(summary['successful_paths'])
+            
         self._sync_metadata_to_disk()
         QMessageBox.information(self, "Success", f"Copied {summary['success']} files to {summary['target_dir']}")
         self.log(f"Copied {summary['success']} files to {summary['target_dir']}")
@@ -2834,46 +3046,163 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Failed", "No changes were applied. Check logs.")
             self.log("Apply changes failed or no files were modified.")
 
+    def _recalculate_item_similarity(self, res):
+        """
+        Recalculates similarity and candidates for a single item against all mod textures.
+        Called after an original file is replaced to update its matching state.
+        """
+        orig = res['original']
+        path = orig.get('save_path')
+        if not path or not os.path.exists(path):
+            self.log(f"  Error: File not found for recalculation: {path}")
+            return False
+            
+        try:
+            # 1. Update metadata from the new file
+            with Image.open(path) as img:
+                orig['width'] = img.width
+                orig['height'] = img.height
+            orig['size'] = os.path.getsize(path)
+            
+            # 2. Calculate new perceptual hash
+            from similarity import get_image_hash
+            orig['hash'] = get_image_hash(path)
+            if orig['hash'] is None:
+                self.log(f"  Error: Failed to calculate hash for {path}")
+                return False
+
+            # 3. Match against mod_textures (Re-running simplified matching logic)
+            if not self.mod_textures:
+                self.log("  Error: No mod textures available for matching.")
+                return False
+                
+            # Ensure all mods have hashes for comparison
+            for m_tex in self.mod_textures:
+                if 'hash' not in m_tex:
+                    m_tex['hash'] = get_image_hash(m_tex.get('save_path'))
+
+            candidate_pool = {}
+            o_name_lower = orig['name'].lower()
+            o_base_lower = get_base_name(orig['name']).lower()
+            
+            same_res = self.chk_same_res.isChecked()
+            filter_enabled = self.chk_sim_filter.isChecked()
+            
+            try:
+                sim_cutoff = float(self.txt_sim_cutoff.text() or 0.5)
+                num_candidates = int(self.num_candidates.text() or 5)
+            except:
+                sim_cutoff = 0.5
+                num_candidates = 5
+
+            # Name matching
+            for m_tex in self.mod_textures:
+                if m_tex.get('name', '').lower() == o_name_lower or get_base_name(m_tex.get('name', '')).lower() == o_base_lower:
+                    candidate_pool[m_tex['save_path']] = m_tex
+                elif same_res and (orig.get('width') != m_tex.get('width') or orig.get('height') != m_tex.get('height')):
+                    continue
+            
+            # Hash matching
+            scores = []
+            from similarity import hamming_similarity
+            for m_tex in self.mod_textures:
+                if 'hash' not in m_tex or m_tex['hash'] is None: continue
+                if same_res and (orig.get('width') != m_tex.get('width') or orig.get('height') != m_tex.get('height')):
+                    continue
+                sim = hamming_similarity(orig['hash'], m_tex['hash'])
+                scores.append((sim, m_tex))
+            
+            scores.sort(key=lambda x: x[0], reverse=True)
+            for sim, m_tex in scores[:num_candidates]:
+                candidate_pool[m_tex['save_path']] = m_tex
+            
+            # Refine candidates with deep comparison
+            all_potentials = []
+            from similarity import compare_images
+            for m_tex in candidate_pool.values():
+                refined_sim = compare_images(orig['save_path'], m_tex['save_path'])
+                is_exact = (m_tex.get('name', '').lower() == o_name_lower)
+                is_same_res = (m_tex.get('width') == orig.get('width') and m_tex.get('height') == orig.get('height'))
+                all_potentials.append({
+                    'tex': m_tex, 'similarity': refined_sim, 
+                    'is_exact': is_exact, 'is_same_res': is_same_res
+                })
+            
+            # Apply filters
+            final_refined = []
+            for r in all_potentials:
+                passes_cutoff = r['similarity'] >= sim_cutoff
+                if not filter_enabled or passes_cutoff or r['is_exact']:
+                    final_refined.append(r)
+
+            if not final_refined:
+                res['match_file'] = None
+                res['best_similarity'] = 0.0
+                res['candidates'] = []
+                self.log(f"  No candidates found for {orig['name']} after recalculation.")
+                return True
+
+            # Pick absolute best
+            def best_sort_key(x):
+                is_perfect = (x['similarity'] >= 1.0)
+                return (1 if is_perfect else 0, 1 if x['is_exact'] else 0, 1 if x['is_same_res'] else 0, x['similarity'])
+            
+            best_candidate = max(final_refined, key=best_sort_key)
+            res['match_file'] = best_candidate['tex']['save_path']
+            res['best_similarity'] = best_candidate['similarity']
+            
+            final_refined.sort(key=lambda x: x['similarity'], reverse=True)
+            
+            # Build simplified candidates list
+            res_candidates = []
+            for r in final_refined[:num_candidates]:
+                m_t = r['tex']
+                res_candidates.append({
+                    "save_path": m_t['save_path'],
+                    "name": m_t.get('name', 'Unknown'),
+                    "width": m_t.get('width', 0),
+                    "height": m_t.get('height', 0),
+                    "size": m_t.get('size', 0),
+                    "similarity": round(r['similarity'], 4),
+                    "is_exact": r['is_exact'],
+                    "is_same_res": r['is_same_res']
+                })
+            res['candidates'] = res_candidates
+            self.log(f"  Similarity updated: {res['best_similarity']:.4f} with {len(res_candidates)} candidates.")
+            return True
+            
+        except Exception as e:
+            self.log(f"  Exception during similarity update for {orig['name']}: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+            return False
+
     def _mark_items_as_replaced(self, successful_paths):
         """
-        Updates the similarity to 1.0 and unchecks the 'replace' status for successfully modified items.
-        Updates both the internal data (self.results) and the UI Tree.
+        Updates metadata, recalculates similarity, and refreshes candidates 
+        for successfully modified items.
         """
         if not successful_paths or not self.results:
             return
             
-        # Convert list to set for O(1) lookup
         success_set = set(os.path.normpath(p) for p in successful_paths)
         
-        changed_indices = []
+        changed_count = 0
         for i, res in enumerate(self.results):
-            # The worker sends r['original']['save_path'] for each successful item
             orig_path = res.get('original', {}).get('save_path')
             if orig_path and os.path.normpath(orig_path) in success_set:
-                res['best_similarity'] = 1.0
-                res['replace'] = False
-                changed_indices.append(i)
+                # Recalculate everything for this original because its file changed
+                self.log(f"Updating similarities for {res['original']['name']}...")
+                if self._recalculate_item_similarity(res):
+                    res['replace'] = False # Uncheck after success
+                    changed_count += 1
         
-        if changed_indices:
-            # Update UI Tree items
-            for i in range(self.tree.topLevelItemCount()):
-                item = self.tree.topLevelItem(i)
-                idx = item.data(2, Qt.ItemDataRole.UserRole)
-                if idx in changed_indices:
-                    res = self.results[idx]
-                    # Update Similarity column (index 4)
-                    item.setText(4, "1.000")
-                    
-                    # Uncheck the item
-                    item.setCheckState(0, Qt.CheckState.Unchecked)
-                    item.setData(0, Qt.ItemDataRole.UserRole, False)
-                    
-                    # Update status column (index 5) - usually "Matched" or something
-                    # item.setText(5, "Replaced")
-                    
-            self.update_status_counts()
-            self.update_copy_button_state()
-            self.log(f"Updated {len(changed_indices)} items in list as successfully replaced (Similarity -> 1.0).")
+        if changed_count > 0:
+            # Rebuild the tree to reflect new candidates and similarities
+            # show_progress=False prevents the progress bar from flickering for small updates
+            self.update_tree(show_progress=False)
+            self._sync_metadata_to_disk()
+            self.log(f"Refreshed {changed_count} items in list after replacement.")
 
     def apply_changes(self):
         to_replace = [r for r in self.results if r.get('replace') and r.get('match_file')]
