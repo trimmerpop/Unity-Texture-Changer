@@ -11,6 +11,17 @@ def build():
     
     spec_name = "UnityTextureChanger"
     
+    # Get fmod.dll path from installed fmod_toolkit package
+    try:
+        import fmod_toolkit
+        fmod_dll_path = os.path.join(
+            os.path.dirname(fmod_toolkit.__file__),
+            'libfmod', 'Windows', 'x64', 'fmod.dll'
+        )
+    except ImportError:
+        print("ERROR: fmod_toolkit package not found. Please install it first.")
+        return
+    
     # 2. PyInstaller command
     cmd = [
         "pyinstaller",
@@ -33,7 +44,9 @@ def build():
         "--hidden-import=packaging.version",
         "--hidden-import=packaging.specifiers",
         "--hidden-import=packaging.requirements",
+        "--hidden-import=fmod_toolkit",
         "--add-data=app_icon.ico;.",
+        f"--add-data={fmod_dll_path};fmod_toolkit/libfmod/Windows/x64",
         "--collect-all=UnityPy",
         "--collect-all=archspec",
         "--collect-all=astc_encoder",
