@@ -607,7 +607,7 @@ class WorkerThread(QThread):
                         self.sig_log.emit(f"Atlas page unchanged: {os.path.basename(page_path)}")
                     processed_count += 1
         
-        # 3. PHASE 0b: Atlas regions (per region mode) -> composite into the original page
+        # 3. PHASE 0b: legacy per-region metadata (older extractions) -> composite into the page
         if atlas_groups:
             self.sig_log.emit(f"Writing {total_atlas} atlas regions into the original pages...")
             for page_path, results in atlas_groups.items():
@@ -869,20 +869,14 @@ class WorkerThread(QThread):
 
         atlas_enabled = bool(self.args.get('atlas_enabled', True))
         atlas_files = atlas_mod.find_atlas_files(folder) if atlas_enabled else []
-        per_region = atlas_enabled and bool(self.args.get('atlas_regions', False))
         for atlas_path in atlas_files:
             atlas = atlas_mod.parse_atlas(atlas_path)
             if not atlas.pages:
                 continue
             out_dir = os.path.join(temp_path, "atlas", os.path.splitext(os.path.basename(atlas_path))[0])
-            if per_region:
-                entries = atlas_mod.extract_atlas_regions(atlas_path, out_dir, log_callback=self.sig_log.emit)
-                self.sig_log.emit(f"Atlas {os.path.basename(atlas_path)}: {len(entries)} regions -> {label}")
-            else:
-                # one item per page: pieces are compared internally (same pieces / all pieces)
-                entries = atlas_mod.extract_atlas_pages(atlas_path, out_dir, log_callback=self.sig_log.emit)
-                if entries:
-                    self.sig_log.emit(f"Atlas {os.path.basename(atlas_path)}: {len(entries)} page item(s) -> {label}")
+            entries = atlas_mod.extract_atlas_pages(atlas_path, out_dir, log_callback=self.sig_log.emit)
+            if entries:
+                self.sig_log.emit(f"Atlas {os.path.basename(atlas_path)}: {len(entries)} page item(s) -> {label}")
             for page in atlas.pages:
                 page_path = os.path.abspath(atlas.page_path(page))
                 page_images.add(os.path.normcase(page_path))
@@ -1624,7 +1618,6 @@ class MainWindow(QMainWindow):
         settings.setValue("options/high_quality", self.chk_high_quality.isChecked())
         settings.setValue("options/save_as_original", self.chk_save_original.isChecked())
         settings.setValue("options/atlas_enabled", self.chk_atlas.isChecked())
-        settings.setValue("options/atlas_regions", self.chk_atlas_region.isChecked())
         settings.setValue("options/scan_all_orig", self.chk_orig_scan_all.isChecked())
         settings.setValue("options/scan_all_mod", self.chk_mod_scan_all.isChecked())
         settings.sync() # Force write to disk immediately
@@ -1669,8 +1662,6 @@ class MainWindow(QMainWindow):
             self.chk_save_original.setChecked(get_bool_val("options/save_as_original", "true"))
 
             self.chk_atlas.setChecked(get_bool_val("options/atlas_enabled", "true"))
-            self.chk_atlas_region.setChecked(get_bool_val("options/atlas_regions", "false"))
-            self.chk_atlas_region.setEnabled(self.chk_atlas.isChecked())
             
             self.chk_orig_scan_all.setChecked(get_bool_val("options/scan_all_orig", "true"))
             self.chk_mod_scan_all.setChecked(get_bool_val("options/scan_all_mod", "true"))
@@ -1744,14 +1735,7 @@ class MainWindow(QMainWindow):
                                   "similarity = same pieces / all pieces, replacements keep the original layout.\n"
                                   "OFF: no atlas handling, the page images are matched as ordinary images.")
         self.chk_atlas.setChecked(True)
-        self.chk_atlas.toggled.connect(self.on_atlas_toggle)
         opt_row1.addWidget(self.chk_atlas)
-
-        self.chk_atlas_region = QCheckBox("Per region")
-        self.chk_atlas_region.setToolTip("Split every atlas region into its own item (fine grained, slower).\n"
-                                         "OFF (default): one item per atlas page.")
-        self.chk_atlas_region.setChecked(False)
-        opt_row1.addWidget(self.chk_atlas_region)
 
         opt_row1.addSpacing(10)
         self.chk_sim_filter = QCheckBox("Cut-off:")
@@ -2285,10 +2269,6 @@ class MainWindow(QMainWindow):
         self.update_buttons()
 
 
-    def on_atlas_toggle(self, checked):
-        """'Per region' only makes sense while atlas handling is enabled."""
-        self.chk_atlas_region.setEnabled(bool(checked) and not self._is_worker_running())
-
     def on_mode_changed(self, mode):
         # Enable Packer only for Unity mode
         self.update_buttons()
@@ -2320,8 +2300,7 @@ class MainWindow(QMainWindow):
                           mode=self.mode_combo.currentText(),
                           orig_scan_all=self.chk_orig_scan_all.isChecked(),
                           mod_scan_all=self.chk_mod_scan_all.isChecked(),
-                          atlas_enabled=self.chk_atlas.isChecked(),
-                          atlas_regions=(self.chk_atlas.isChecked() and self.chk_atlas_region.isChecked()))
+                          atlas_enabled=self.chk_atlas.isChecked())
 
     def on_extraction_finished(self, data):
         self.orig_textures = data['orig']
@@ -3569,7 +3548,6 @@ class MainWindow(QMainWindow):
         self.txt_sim_cutoff.setEnabled(not is_running and self.chk_sim_filter.isChecked())
         self.chk_same_res.setEnabled(not is_running)
         self.chk_atlas.setEnabled(not is_running)
-        self.chk_atlas_region.setEnabled(not is_running and self.chk_atlas.isChecked())
         self.diff_check.setEnabled(not is_running)
         self.chk_show_log.setEnabled(not is_running)
         self.btn_toggle_expand.setEnabled(has_results and not is_running)
