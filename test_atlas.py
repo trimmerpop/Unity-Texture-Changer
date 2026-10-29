@@ -207,8 +207,8 @@ def test_page_digests(fixture):
 
     same = atlas_mod.compare_piece_digests(digests, digests, regions, regions)
     check("digests: identical pages -> ratio 1.0", same.ratio == 1.0 and same.changed == 0, same.to_dict())
-    check("digests: summary text", same.summary().endswith("same") and str(len(regions)) in same.summary(),
-          same.summary())
+    check("digests: summary text shows percent and (same/total)",
+          "%" in same.summary() and f"({same.same}/{same.total})" in same.summary(), same.summary())
 
     changed_page = page.copy()
     changed_page.paste(Image.new("RGBA", (4, 4), (1, 2, 3, 255)), (21, 21))  # inside the r270 block

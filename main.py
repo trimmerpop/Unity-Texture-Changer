@@ -85,6 +85,19 @@ class SortableTreeWidgetItem(QTreeWidgetItem):
             if p1 != p2: return p1 < p2
             return False
 
+        # Atlas column (10) sorts by the stored numeric ratio (percent text would sort wrong)
+        if column == 10:
+            try:
+                r1 = self.data(10, Qt.ItemDataRole.UserRole)
+                r2 = other.data(10, Qt.ItemDataRole.UserRole)
+                v1 = float(r1) if r1 is not None else -1.0
+                v2 = float(r2) if r2 is not None else -1.0
+                if v1 != v2:
+                    return v1 < v2
+            except (TypeError, ValueError):
+                pass
+            return tie_breaker()
+
         # If this is a child item (Candidate), ALWAYS sort by Similarity (Col 4) DESCENDING
         if self.parent():
             try:
@@ -279,9 +292,15 @@ def atlas_page_regions(meta):
 
 def atlas_page_stats(orig_meta, mod_meta):
     """Piece-overlap statistics between two atlas pages (same pieces / all pieces)."""
-    stats = atlas_mod.compare_piece_digests(orig_meta.get('digests') or {}, mod_meta.get('digests') or {},
-                                            atlas_page_regions(orig_meta), atlas_page_regions(mod_meta))
-    return stats
+    orig_sigs = orig_meta.get('signatures')
+    mod_sigs = mod_meta.get('signatures')
+    orig_regions = atlas_page_regions(orig_meta)
+    mod_regions = atlas_page_regions(mod_meta)
+    if orig_sigs and mod_sigs:
+        return atlas_mod.compare_signatures(orig_sigs, mod_sigs, orig_regions, mod_regions)
+    # metadata from an older extraction only carries md5 digests
+    return atlas_mod.compare_piece_digests(orig_meta.get('digests') or {}, mod_meta.get('digests') or {},
+                                           orig_regions, mod_regions)
 
 
 def atlas_geometry(orig_tex, match_tex):
@@ -440,7 +459,9 @@ class WorkerThread(QThread):
         if mod_image is None:
             return 0
         mod_by = {atlas_mod.region_key(r.name): r for r in mod_regions}
-        digests = dict(orig_meta.get('digests') or {})
+        signatures = dict(orig_meta.get('signatures') or {})
+        if not signatures and orig_meta.get('digests'):
+            signatures = {key: {"md5": value, "h": ""} for key, value in orig_meta['digests'].items()}
         updates = []
         for region in orig_regions:
             key = atlas_mod.region_key(region.name)
@@ -451,16 +472,19 @@ class WorkerThread(QThread):
                 piece = atlas_mod.unpack_region(mod_image, twin)
             except Exception:
                 continue
-            digest = atlas_mod.piece_digest(piece)
-            if digests.get(key) == digest:
+            signature = atlas_mod.piece_signature(piece)
+            known = signatures.get(key) or {}
+            if known.get("md5") and known.get("md5") == signature.get("md5"):
                 continue  # identical piece -> keep the original pixels
+            if atlas_mod.hash_similarity(known.get("h", ""), signature.get("h", "")) >= 0.995:
+                continue  # only re-encode noise -> keep the original pixels
             updates.append((region, piece, mod_pma))
-            digests[key] = digest
+            signatures[key] = signature
         if not updates:
             return 0
         if not atlas_mod.write_page_regions(page_path, updates):
             return 0
-        orig_meta['digests'] = digests  # keep the metadata in sync with the page
+        orig_meta['signatures'] = signatures  # keep the metadata in sync with the page
         return len(updates)
 
     def run_apply(self):
@@ -1088,7 +1112,7 @@ class WorkerThread(QThread):
             o_page = o_tex.get('atlas_page') or {}
             all_potentials = []
 
-            # ---- Atlas page items: one row per page, pieces compared through digests ----
+            # ---- Atlas page items: one row per page, pieces compared through signatures ----
             if o_page:
                 for m_tex in mod_textures:
                     m_page = m_tex.get('atlas_page') or {}
@@ -1100,8 +1124,14 @@ class WorkerThread(QThread):
                     o_strong, o_weak = atlas_keys(o_tex)
                     m_strong, m_weak = atlas_keys(m_tex)
                     is_identity = bool(o_weak) and o_weak == m_weak
+                    # plain page similarity (fallback when pieces were renamed) is merged
+                    # with the atlas overlap: a candidate ranks by the better of both, so
+                    # an atlas match of 90% beats a plain match of 50%
+                    plain_sim = compare_images(o_tex['save_path'], m_tex['save_path'], trim=True)
                     all_potentials.append({
-                        'tex': m_tex, 'similarity': stats.ratio,
+                        'tex': m_tex, 'similarity': max(stats.ratio, plain_sim),
+                        'plain_similarity': plain_sim,
+                        'atlas_ratio': stats.ratio,
                         'is_exact': is_identity,
                         'is_same_res': (m_page.get('page_size') == o_page.get('page_size')),
                         'atlas_state': "page",
@@ -1226,6 +1256,8 @@ class WorkerThread(QThread):
                     "atlas_state": r['atlas_state'],
                     "atlas_text": r['atlas_text'],
                     "atlas_detail": r['atlas_detail'],
+                    "atlas_ratio": r.get('atlas_ratio'),
+                    "plain_similarity": r.get('plain_similarity'),
                     "match_by": r['match_by'],
                 })
             if not IsAddedBestCandidate:
@@ -1245,6 +1277,8 @@ class WorkerThread(QThread):
                     "atlas_state": best_candidate['atlas_state'],
                     "atlas_text": best_candidate['atlas_text'],
                     "atlas_detail": best_candidate['atlas_detail'],
+                    "atlas_ratio": best_candidate.get('atlas_ratio'),
+                    "plain_similarity": best_candidate.get('plain_similarity'),
                     "match_by": best_candidate['match_by'],
                 })
 
@@ -1256,8 +1290,8 @@ class WorkerThread(QThread):
             elif best_similarity >= 1.0 and unchecked_same:
                 # Already identical
                 should_replace = False
-            if o_page and best_similarity >= 1.0:
-                # every piece of the page is identical -> nothing to write
+            if o_page and (best_candidate.get('atlas_ratio') or 0.0) >= 1.0:
+                # every piece of the page is the same -> nothing to write
                 should_replace = False
 
             best_page_meta = best_candidate['tex'].get('atlas_page') or {}
@@ -1273,6 +1307,8 @@ class WorkerThread(QThread):
                 "atlas_state": best_candidate['atlas_state'],
                 "atlas_text": best_candidate['atlas_text'],
                 "atlas_detail": best_candidate['atlas_detail'],
+                "atlas_ratio": best_candidate.get('atlas_ratio'),
+                "plain_similarity": best_candidate.get('plain_similarity'),
                 "match_by": best_candidate['match_by'],
                 "piece_stats": best_candidate.get('piece_stats', {}),
                 # page level items need the matched page to composite the changed pieces
@@ -2637,7 +2673,8 @@ class MainWindow(QMainWindow):
                 item.setText(6, str(p_id))
 
             # Atlas column: packing geometry of the matched region ("-" for plain images)
-            self._apply_atlas_cell(item, res.get('atlas_state'), res.get('atlas_text'), res.get('atlas_detail'))
+            self._apply_atlas_cell(item, res.get('atlas_state'), res.get('atlas_text'), res.get('atlas_detail'),
+                                   ratio=(res.get('piece_stats') or {}).get('ratio'))
 
             # Right-align numeric columns (Original)
             for col in [2, 3, 4, 6]:
@@ -2687,7 +2724,7 @@ class MainWindow(QMainWindow):
                     c_item.setText(3, f"{cand.get('size', 0)/1024:.1f} KB")
                     c_item.setText(4, f"{c_sim:.4f}")
                     self._apply_atlas_cell(c_item, cand.get('atlas_state'), cand.get('atlas_text'),
-                                           cand.get('atlas_detail'))
+                                           cand.get('atlas_detail'), ratio=cand.get('atlas_ratio'))
 
                     # Right-align numeric columns (Candidate)
                     for col in [2, 3, 4]:
@@ -2735,7 +2772,7 @@ class MainWindow(QMainWindow):
         finally:
             self._is_syncing_widths = False
 
-    def _apply_atlas_cell(self, item, state, text, detail):
+    def _apply_atlas_cell(self, item, state, text, detail, ratio=None):
         """Renders how the two builds packed an atlas region in the "Atlas" column."""
         colors = {
             "same": QColor(76, 175, 80),      # green
@@ -2748,9 +2785,11 @@ class MainWindow(QMainWindow):
         state = state or "none"
         item.setText(10, text or "-")
         item.setForeground(10, QBrush(colors.get(state, colors["none"])))
+        # numeric value for sorting the column (the text is a percentage)
+        item.setData(10, Qt.ItemDataRole.UserRole, float(ratio) if ratio is not None else None)
         tip = detail or ""
         if state == "page":
-            tip += "\n\nSimilarity = identical pieces / all pieces of the page."
+            tip += "\n\nSimilarity = same pieces / all pieces of the page."
         elif state == "resized":
             tip += "\n\nThe trim differs between the builds; the similarity above is trim-normalised."
         elif state in ("moved", "rotated"):
@@ -2783,7 +2822,8 @@ class MainWindow(QMainWindow):
             atlas_state = res_data.get('atlas_state')
             atlas_text = res_data.get('atlas_text')
             atlas_detail = res_data.get('atlas_detail')
-        self._apply_atlas_cell(item, atlas_state, atlas_text, atlas_detail)
+        self._apply_atlas_cell(item, atlas_state, atlas_text, atlas_detail,
+                               ratio=(res_data.get('piece_stats') or {}).get('ratio'))
         if (orig.get('atlas') or {}).get('region'):
             item.setToolTip(4, "Trim-normalised similarity (transparent borders ignored)\n"
                                f"matched by: {res_data.get('match_by', 'sim')}")

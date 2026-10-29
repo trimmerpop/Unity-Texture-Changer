@@ -14,6 +14,7 @@ PROJECT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT)
 
 from PIL import Image, ImageChops
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
 import atlas as atlas_mod
@@ -296,7 +297,7 @@ def test_page_mode():
         print(f"  info  {len(orig_items)} page items per side (region mode had 130)")
         check("page: one item per atlas page", 1 <= len(orig_items) <= 4, len(orig_items))
         check("page: every item is an atlas page",
-              all(t.get("atlas_page", {}).get("digests") for t in orig_items))
+              all(t.get("atlas_page", {}).get("signatures") for t in orig_items))
         check("page: page items carry no region metadata", all(not t.get("atlas") for t in orig_items))
         check("page: preview file exists for each page",
               all(os.path.exists(t["save_path"]) for t in orig_items))
@@ -322,19 +323,22 @@ def test_page_mode():
         if ten:
             stats = ten.get("piece_stats") or {}
             print(f"  info  10p.png: {stats}")
-            check("page: fully re-drawn page scores 0", abs(ten["best_similarity"]) < 1e-9,
-                  ten["best_similarity"])
-            check("page: Atlas column shows the piece counts", "p /" in (ten.get("atlas_text") or ""),
-                  ten.get("atlas_text"))
-            check("page: Atlas tooltip explains the overlap", "pieces identical" in (ten.get("atlas_detail") or ""),
+            check("page: identity page is paired", ten.get("match_by") == "atlas", ten.get("match_by"))
+            check("page: mostly unchanged page scores high", (ten.get("atlas_ratio") or 0) >= 0.85,
+                  ten.get("atlas_ratio"))
+            check("page: Atlas column shows percent and (same/total)",
+                  "% (" in (ten.get("atlas_text") or ""), ten.get("atlas_text"))
+            check("page: Atlas tooltip explains the overlap", "same pieces" in (ten.get("atlas_detail") or ""),
                   ten.get("atlas_detail"))
+            check("page: similarity merges atlas and plain scores",
+                  ten["best_similarity"] >= (ten.get("atlas_ratio") or 0) - 1e-9, ten["best_similarity"])
         if cg42:
             stats = cg42.get("piece_stats") or {}
             total = max(1, stats.get("pieces", 1) + stats.get("missing", 0))
-            expected = stats.get("identical", 0) / total
+            expected = stats.get("same", 0) / total
             print(f"  info  hina_cg4_2.png: {stats} -> expected {expected:.4f}")
-            check("page: ratio == identical pieces / total pieces",
-                  abs(cg42["best_similarity"] - expected) < 1e-6, (cg42["best_similarity"], expected))
+            check("page: ratio == same pieces / total pieces",
+                  abs((cg42.get("atlas_ratio") or 0) - expected) < 1e-6, (cg42.get("atlas_ratio"), expected))
 
         print("== apply (page mode) ==")
         to_replace = [r for r in results if r.get("match_file")][:3]
@@ -380,11 +384,18 @@ def test_page_mode():
             window.results = results
             window.update_tree(show_progress=False)
             top = window.tree.topLevelItem(0)
-            check("page ui: Atlas cell shows the piece overlap", "p /" in top.text(10), top.text(10))
+            check("page ui: Atlas cell shows the overlap", "% (" in top.text(10), top.text(10))
             check("page ui: Similarity tooltip explains the metric",
                   "Piece overlap" in top.toolTip(4), top.toolTip(4)[:60])
             check("page ui: Atlas tooltip explains the ratio",
-                  "identical pieces" in top.toolTip(10), top.toolTip(10)[:80])
+                  "same pieces" in top.toolTip(10), top.toolTip(10)[:80])
+            # the Atlas column must sort numerically, not alphabetically
+            window.tree.sortItems(10, Qt.SortOrder.DescendingOrder)
+            ratios = [window.tree.topLevelItem(i).data(10, Qt.ItemDataRole.UserRole)
+                      for i in range(window.tree.topLevelItemCount())]
+            numeric = [r for r in ratios if isinstance(r, (int, float))]
+            check("page ui: Atlas column sorts by the numeric ratio",
+                  numeric == sorted(numeric, reverse=True), numeric)
             window.close()
         except Exception as error:
             check(f"page ui: tree rendering ({type(error).__name__})", False, str(error))
