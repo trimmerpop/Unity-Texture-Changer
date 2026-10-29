@@ -281,6 +281,9 @@ def test_page_mode():
         temp_mod = os.path.join(root, "temp_mod")
         os.makedirs(temp_orig, exist_ok=True)
         os.makedirs(temp_mod, exist_ok=True)
+        # a plain image in the modified folder must still be offered as a candidate
+        Image.new("RGBA", (256, 256), (40, 90, 160, 255)).save(
+            os.path.join(mod_dir, "plain_candidate.png"), format="PNG")
         os.chdir(root)
 
         print("== extract (page mode) ==")
@@ -297,7 +300,7 @@ def test_page_mode():
         print(f"  info  {len(orig_items)} page items per side (region mode had 130)")
         check("page: one item per atlas page", 1 <= len(orig_items) <= 4, len(orig_items))
         check("page: every item is an atlas page",
-              all(t.get("atlas_page", {}).get("signatures") for t in orig_items))
+              all(t.get("atlas_page", {}).get("digests") for t in orig_items))
         check("page: page items carry no region metadata", all(not t.get("atlas") for t in orig_items))
         check("page: preview file exists for each page",
               all(os.path.exists(t["save_path"]) for t in orig_items))
@@ -316,6 +319,13 @@ def test_page_mode():
         check("page: one result per page", len(results) == len(orig_items), (len(results), len(orig_items)))
         check("page: pages were paired", all(r.get("match_file") for r in results),
               [r.get("match_file") for r in results])
+        plain_candidates = [c for r in results for c in (r.get("candidates") or [])
+                            if c.get("name", "").startswith("plain_candidate")]
+        check("page: plain images are still offered as candidates", bool(plain_candidates),
+              [c.get("name") for r in results for c in (r.get("candidates") or [])][:6])
+        check("page: plain candidates carry no atlas ratio",
+              all(c.get("atlas_ratio") is None for c in plain_candidates),
+              [c.get("atlas_ratio") for c in plain_candidates][:3])
 
         by_page = {os.path.basename(r["original"]["atlas_page"]["page_file"]): r for r in results}
         ten = by_page.get("10p.png")
@@ -404,9 +414,57 @@ def test_page_mode():
         remove_tree(root)
 
 
+def test_atlas_disabled():
+    """Check Atlas OFF: .atlas files are ignored, page images behave like plain images."""
+    root = tempfile.mkdtemp(prefix="atlas_off_", dir=os.path.dirname(PROJECT))
+    cwd = os.getcwd()
+    try:
+        orig_dir, mod_dir = prepare_pair(root)
+        if not orig_dir or not mod_dir:
+            print("  SKIP  game folders from config.ini not available")
+            return
+        temp_orig = os.path.join(root, "temp_orig")
+        temp_mod = os.path.join(root, "temp_mod")
+        os.makedirs(temp_orig, exist_ok=True)
+        os.makedirs(temp_mod, exist_ok=True)
+        os.chdir(root)
+
+        data, error = run_worker(
+            "extract", "run_extract",
+            orig_dir=orig_dir, mod_dir=mod_dir, temp_orig=temp_orig, temp_mod=temp_mod,
+            mode="Image", orig_scan_all=False, mod_scan_all=False,
+            atlas_enabled=False, atlas_regions=False,
+        )
+        check("off: extract finished without error", error is None, error)
+        orig_items = (data or {}).get("orig", [])
+        print(f"  info  {len(orig_items)} items without atlas handling: {[t['name'] for t in orig_items]}")
+        check("off: no atlas metadata on the items",
+              all(not t.get("atlas_page") and not t.get("atlas") for t in orig_items))
+        check("off: atlas page images become ordinary items",
+              any(t["name"].startswith("10p") for t in orig_items), [t["name"] for t in orig_items])
+
+        print("== UI checkboxes ==")
+        window = app_main.MainWindow()
+        check("ui: 'Check Atlas' exists and defaults to on",
+              window.chk_atlas.text() == "Check Atlas" and window.chk_atlas.isChecked(),
+              (window.chk_atlas.text(), window.chk_atlas.isChecked()))
+        check("ui: 'Per region' is enabled while atlas handling is on",
+              window.chk_atlas_region.isEnabled() and window.chk_atlas_region.text() == "Per region")
+        window.chk_atlas.setChecked(False)
+        check("ui: 'Per region' is disabled when atlas handling is off",
+              not window.chk_atlas_region.isEnabled())
+        window.chk_atlas.setChecked(True)
+        check("ui: re-enabling 'Check Atlas' re-enables 'Per region'", window.chk_atlas_region.isEnabled())
+        window.close()
+    finally:
+        os.chdir(cwd)
+        remove_tree(root)
+
+
 def main():
     test_end_to_end()
     test_page_mode()
+    test_atlas_disabled()
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")
     if FAILURES:

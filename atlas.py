@@ -394,67 +394,66 @@ def region_key(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "")).strip().lower()
 
 
-def piece_signature(image: Image.Image) -> Dict[str, str]:
-    """Two signatures of a piece: exact md5 and a 16x16 perceptual hash.
+PIECE_TOLERANCE = {"mae": 2.0, "changed_pct": 1.0, "peak": 48.0}
+"""Pixel tolerance for "same piece" when the trimmed md5 differs.
 
-    md5 detects exactly identical pixels (PNG re-encode noise changes it), the hash lets a
-    piece count as "same" when only compression noise changed it.
-    """
+Calibrated on real builds: unchanged pieces are byte identical, real edits (censoring,
+mosaic, redraw) show a peak difference far above 48, while a re-export with another
+compression stays below it.
+"""
+
+
+def trim_alpha(image: Image.Image) -> Image.Image:
+    """Crops the fully transparent border (Pillow image)."""
     if image.mode != "RGBA":
         image = image.convert("RGBA")
-    md5 = hashlib.md5(image.tobytes()).hexdigest()
-    arr = np.asarray(image)
-    mask = arr[:, :, 3] > 10
-    if mask.any():
-        rows = np.flatnonzero(mask.any(axis=1))
-        cols = np.flatnonzero(mask.any(axis=0))
-        arr = arr[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
-        mask = mask[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
-    gray = arr[:, :, :3].astype(np.float32).mean(axis=2)
-    gray[~mask] = 0
-    height, width = gray.shape[:2]
-    if not height or not width:
-        return {"md5": md5, "h": ""}
-    ys = (np.arange(16) * height // 16).clip(0, height - 1)
-    xs = (np.arange(16) * width // 16).clip(0, width - 1)
-    small = gray[np.ix_(ys, xs)]
-    bits = (small > small.mean()).flatten()
-    packed = np.packbits(bits.astype(np.uint8))
-    return {"md5": md5, "h": packed.tobytes().hex()}
+    mask = np.asarray(image)[:, :, 3] > 10
+    if not mask.any():
+        return image
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    return image.crop((int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1))
 
 
-def hash_similarity(hex_a: str, hex_b: str) -> float:
-    """Bit similarity of two packed hashes (1.0 = identical bits)."""
-    if not hex_a or not hex_b or len(hex_a) != len(hex_b):
-        return 0.0
-    try:
-        a = np.frombuffer(bytes.fromhex(hex_a), dtype=np.uint8)
-        b = np.frombuffer(bytes.fromhex(hex_b), dtype=np.uint8)
-    except ValueError:
-        return 0.0
-    bits_a = np.unpackbits(a)
-    bits_b = np.unpackbits(b)
-    if len(bits_a) != len(bits_b) or not len(bits_a):
-        return 0.0
-    return 1.0 - float(np.count_nonzero(bits_a != bits_b)) / len(bits_a)
+def piece_digest(image: Image.Image) -> str:
+    """md5 of the visible (alpha trimmed) pixels of a piece.
+
+    Trimming first is what makes the digest meaningful: the same sprite packed with a
+    different amount of transparent padding must still compare equal.
+    """
+    return hashlib.md5(np.ascontiguousarray(np.asarray(trim_alpha(image))).tobytes()).hexdigest()
 
 
-def page_piece_signatures(page_image: Image.Image, regions: Sequence[AtlasRegion]) -> Dict[str, Dict[str, str]]:
-    """Maps region_key(name) -> piece signature for every piece of a page."""
-    signatures: Dict[str, Dict[str, str]] = {}
+def page_piece_digests(page_image: Image.Image, regions: Sequence[AtlasRegion]) -> Dict[str, str]:
+    """Maps region_key(name) -> trimmed md5 digest for every piece of a page."""
+    digests: Dict[str, str] = {}
     for region in regions:
         if not region.width or not region.height:
             continue
         try:
-            signatures[region_key(region.name)] = piece_signature(unpack_region(page_image, region))
+            digests[region_key(region.name)] = piece_digest(unpack_region(page_image, region))
         except Exception:
             continue
-    return signatures
+    return digests
 
 
-def page_piece_digests(page_image: Image.Image, regions: Sequence[AtlasRegion]) -> Dict[str, str]:
-    """Maps region_key(name) -> md5 digest for every piece of a page."""
-    return {key: value["md5"] for key, value in page_piece_signatures(page_image, regions).items()}
+def pieces_near_identical(a: Image.Image, b: Image.Image, tolerance: Optional[dict] = None) -> bool:
+    """Pixel tolerance check for pieces whose trimmed digest differs.
+
+    Absorbs re-encode noise but not real edits: a small mosaic patch still shows a large
+    peak difference and is therefore reported as changed.
+    """
+    tol = tolerance or PIECE_TOLERANCE
+    ta = np.asarray(trim_alpha(a))
+    tb = np.asarray(trim_alpha(b))
+    if ta.shape != tb.shape:
+        return False
+    gray_a = ta[:, :, :3].astype(np.int16).mean(axis=2)
+    gray_b = tb[:, :, :3].astype(np.int16).mean(axis=2)
+    diff = np.abs(gray_a - gray_b)
+    return (float(diff.mean()) <= tol["mae"]
+            and float((diff > 8).mean() * 100) <= tol["changed_pct"]
+            and float(diff.max()) <= tol["peak"])
 
 
 @dataclass
@@ -513,24 +512,21 @@ class PageStats:
         return "\n".join(lines)
 
 
-def compare_signatures(orig_signatures: Dict[str, Dict[str, str]], mod_signatures: Dict[str, Dict[str, str]],
-                       orig_regions: Sequence[AtlasRegion] = (),
-                       mod_regions: Sequence[AtlasRegion] = (),
-                       near_threshold: float = 0.995) -> PageStats:
-    """Compares two pages piece by piece through their signatures (no page decoding)."""
+def compare_piece_digests(orig_digests: Dict[str, str], mod_digests: Dict[str, str],
+                          orig_regions: Sequence[AtlasRegion] = (),
+                          mod_regions: Sequence[AtlasRegion] = ()) -> PageStats:
+    """Fast pass: compares two pages by their trimmed md5 digests (no page decoding)."""
     stats = PageStats()
     orig_by = {region_key(r.name): r for r in orig_regions}
     mod_by = {region_key(r.name): r for r in mod_regions}
-    for key, sig in orig_signatures.items():
-        twin = mod_signatures.get(key)
+    for key, digest in orig_digests.items():
+        twin = mod_digests.get(key)
         if twin is None:
             stats.missing += 1
             continue
         stats.pieces += 1
-        if sig.get("md5") and sig.get("md5") == twin.get("md5"):
+        if digest == twin:
             stats.identical += 1
-        elif hash_similarity(sig.get("h", ""), twin.get("h", "")) >= near_threshold:
-            stats.similar += 1
         else:
             stats.changed += 1
         a, b = orig_by.get(key), mod_by.get(key)
@@ -541,19 +537,52 @@ def compare_signatures(orig_signatures: Dict[str, Dict[str, str]], mod_signature
                 stats.rotated += 1
             elif (a.x, a.y) != (b.x, b.y):
                 stats.moved += 1
-    for key in mod_signatures:
-        if key not in orig_signatures:
+    for key in mod_digests:
+        if key not in orig_digests:
             stats.extra += 1
     return stats
 
 
-def compare_piece_digests(orig_digests: Dict[str, str], mod_digests: Dict[str, str],
-                          orig_regions: Sequence[AtlasRegion] = (),
-                          mod_regions: Sequence[AtlasRegion] = ()) -> PageStats:
-    """Compares two pages by their md5 digests only (no near-identical tier)."""
-    orig_sigs = {key: {"md5": value, "h": ""} for key, value in orig_digests.items()}
-    mod_sigs = {key: {"md5": value, "h": ""} for key, value in mod_digests.items()}
-    return compare_signatures(orig_sigs, mod_sigs, orig_regions, mod_regions, near_threshold=1.01)
+def compare_pages_pixels(orig_page_image: Image.Image, mod_page_image: Image.Image,
+                         orig_regions: Sequence[AtlasRegion], mod_regions: Sequence[AtlasRegion],
+                         tolerance: Optional[dict] = None) -> PageStats:
+    """Exact pass: decodes both pages and classifies every piece by its visible pixels.
+
+    identical = trimmed pixels equal, similar = within the re-encode tolerance,
+    changed = a real edit (a small mosaic patch also lands here). Use it when the fast
+    digest pass reported differences, so re-encoded art is not counted as changed.
+    """
+    stats = PageStats()
+    mod_by = {region_key(r.name): r for r in mod_regions}
+    orig_by = {region_key(r.name): r for r in orig_regions}
+    for key, region in orig_by.items():
+        twin = mod_by.get(key)
+        if twin is None:
+            stats.missing += 1
+            continue
+        stats.pieces += 1
+        try:
+            piece_a = unpack_region(orig_page_image, region)
+            piece_b = unpack_region(mod_page_image, twin)
+        except Exception:
+            stats.changed += 1
+            continue
+        if piece_digest(piece_a) == piece_digest(piece_b):
+            stats.identical += 1
+        elif pieces_near_identical(piece_a, piece_b, tolerance):
+            stats.similar += 1
+        else:
+            stats.changed += 1
+        if (region.width, region.height) != (twin.width, twin.height):
+            stats.trimmed += 1
+        elif region.rotate != twin.rotate:
+            stats.rotated += 1
+        elif (region.x, region.y) != (twin.x, twin.y):
+            stats.moved += 1
+    for key in mod_by:
+        if key not in orig_by:
+            stats.extra += 1
+    return stats
 
 
 def load_page_image(page_path: str) -> Optional[Image.Image]:
@@ -657,7 +686,7 @@ def extract_atlas_pages(atlas_path: str, out_dir: str, preview_max: int = 1024,
             log(f"  [ATLAS] Page image missing/unreadable: {page.name}")
             continue
         page.width, page.height = page_image.size
-        signatures = page_piece_signatures(page_image, page.regions)
+        digests = page_piece_digests(page_image, page.regions)
 
         preview = page_image
         if max(preview.size) > preview_max:
@@ -687,13 +716,13 @@ def extract_atlas_pages(atlas_path: str, out_dir: str, preview_max: int = 1024,
                 "atlas_file": atlas_path,
                 "page_file": page_path,
                 "page_size": [page.width, page.height],
-                "pieces": len(signatures),
+                "pieces": len(digests),
                 "pma": page.pma,
                 "scale": page.scale,
-                "signatures": signatures,
+                "digests": digests,
             },
         })
-        log(f"  [ATLAS] {os.path.basename(atlas_path)}: page {page.name} -> {len(signatures)} pieces (1 item)")
+        log(f"  [ATLAS] {os.path.basename(atlas_path)}: page {page.name} -> {len(digests)} pieces (1 item)")
     return entries
 
 

@@ -216,6 +216,31 @@ def test_page_digests(fixture):
     diff = atlas_mod.compare_piece_digests(digests, changed, regions, regions)
     check("digests: one changed piece lowers the ratio", diff.changed == 1 and diff.ratio < 1.0, diff.to_dict())
 
+    # trimming: the same piece with an extra transparent border must stay identical
+    region = regions[0]
+    piece = atlas_mod.unpack_region(page, region)
+    padded = Image.new("RGBA", (piece.width + 6, piece.height + 6), (0, 0, 0, 0))
+    padded.paste(piece, (3, 3))
+    check("digests: transparent padding is ignored",
+          atlas_mod.piece_digest(piece) == atlas_mod.piece_digest(padded))
+
+    # a small mosaic patch must NOT be treated as unchanged (needs a textured piece)
+    import numpy as np
+    grid_y, grid_x = np.mgrid[0:40, 0:40]
+    textured = Image.fromarray(np.dstack([
+        (grid_x * 6 % 256).astype(np.uint8),
+        (grid_y * 6 % 256).astype(np.uint8),
+        ((grid_x + grid_y) * 3 % 256).astype(np.uint8),
+        np.full((40, 40), 255, np.uint8),
+    ]).astype(np.uint8), "RGBA")
+    mosaic_src = textured.copy()
+    box = mosaic_src.crop((10, 10, 26, 26))
+    mosaic_src.paste(box.resize((4, 4), Image.Resampling.NEAREST).resize(box.size, Image.Resampling.NEAREST), (10, 10))
+    check("digests: a mosaic edit changes the digest",
+          atlas_mod.piece_digest(textured) != atlas_mod.piece_digest(mosaic_src))
+    check("digests: a mosaic edit is not near-identical",
+          not atlas_mod.pieces_near_identical(textured, mosaic_src))
+
     partial = dict(digests)
     partial.pop(next(iter(partial)))
     stats = atlas_mod.compare_piece_digests(digests, partial, regions, regions)

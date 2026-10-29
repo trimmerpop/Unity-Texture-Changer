@@ -291,16 +291,23 @@ def atlas_page_regions(meta):
 
 
 def atlas_page_stats(orig_meta, mod_meta):
-    """Piece-overlap statistics between two atlas pages (same pieces / all pieces)."""
-    orig_sigs = orig_meta.get('signatures')
-    mod_sigs = mod_meta.get('signatures')
+    """Piece-overlap statistics between two atlas pages (same pieces / all pieces).
+
+    The fast pass compares trimmed md5 digests only. When something differs, both pages are
+    decoded once so re-encoded art is not counted as a change (a real edit, e.g. a small
+    mosaic patch, stays "changed" thanks to the pixel tolerance).
+    """
     orig_regions = atlas_page_regions(orig_meta)
     mod_regions = atlas_page_regions(mod_meta)
-    if orig_sigs and mod_sigs:
-        return atlas_mod.compare_signatures(orig_sigs, mod_sigs, orig_regions, mod_regions)
-    # metadata from an older extraction only carries md5 digests
-    return atlas_mod.compare_piece_digests(orig_meta.get('digests') or {}, mod_meta.get('digests') or {},
-                                           orig_regions, mod_regions)
+    stats = atlas_mod.compare_piece_digests(orig_meta.get('digests') or {}, mod_meta.get('digests') or {},
+                                            orig_regions, mod_regions)
+    if stats.changed == 0:
+        return stats
+    page_a = atlas_mod.load_page_image(orig_meta.get('page_file') or '')
+    page_b = atlas_mod.load_page_image(mod_meta.get('page_file') or '')
+    if page_a is None or page_b is None:
+        return stats
+    return atlas_mod.compare_pages_pixels(page_a, page_b, orig_regions, mod_regions)
 
 
 def atlas_geometry(orig_tex, match_tex):
@@ -459,9 +466,8 @@ class WorkerThread(QThread):
         if mod_image is None:
             return 0
         mod_by = {atlas_mod.region_key(r.name): r for r in mod_regions}
-        signatures = dict(orig_meta.get('signatures') or {})
-        if not signatures and orig_meta.get('digests'):
-            signatures = {key: {"md5": value, "h": ""} for key, value in orig_meta['digests'].items()}
+        digests = dict(orig_meta.get('digests') or {})
+        orig_image = atlas_mod.load_page_image(page_path)
         updates = []
         for region in orig_regions:
             key = atlas_mod.region_key(region.name)
@@ -472,19 +478,28 @@ class WorkerThread(QThread):
                 piece = atlas_mod.unpack_region(mod_image, twin)
             except Exception:
                 continue
-            signature = atlas_mod.piece_signature(piece)
-            known = signatures.get(key) or {}
-            if known.get("md5") and known.get("md5") == signature.get("md5"):
+            digest = atlas_mod.piece_digest(piece)
+            if digests.get(key) == digest:
                 continue  # identical piece -> keep the original pixels
-            if atlas_mod.hash_similarity(known.get("h", ""), signature.get("h", "")) >= 0.995:
-                continue  # only re-encode noise -> keep the original pixels
+            # Pixel verification: a piece that only differs by re-encode noise stays as is,
+            # while real edits (mosaic, redraw) are always written.
+            if orig_image is not None:
+                try:
+                    original_piece = atlas_mod.unpack_region(orig_image, region)
+                    if atlas_mod.pieces_near_identical(original_piece, piece):
+                        digests[key] = digest
+                        continue
+                except Exception:
+                    pass
             updates.append((region, piece, mod_pma))
-            signatures[key] = signature
+            digests[key] = digest
         if not updates:
+            if orig_meta.get('digests') != digests:
+                orig_meta['digests'] = digests  # near-identical pieces are "same" from now on
             return 0
         if not atlas_mod.write_page_regions(page_path, updates):
             return 0
-        orig_meta['signatures'] = signatures  # keep the metadata in sync with the page
+        orig_meta['digests'] = digests  # keep the metadata in sync with the page
         return len(updates)
 
     def run_apply(self):
@@ -844,16 +859,18 @@ class WorkerThread(QThread):
     def _extract_folder_images(self, folder, temp_path, label):
         """Atlas aware fallback extraction for plain folders (no Unity assets found).
 
-        Folders that contain .atlas files are split into their individual regions: the
-        page sheet itself is not offered as an item, because matching and replacing a
-        4000px sheet is useless. Page images referenced by an atlas are therefore
-        excluded from the plain image scan.
+        With atlas handling on, an .atlas page becomes ONE item and its pieces are compared
+        internally ("same pieces / all pieces"); the page sheet is then excluded from the
+        plain image scan. With atlas handling off, the .atlas files are ignored and the page
+        images are offered as ordinary images.
         """
         textures = []
         page_images = set()
 
-        per_region = bool(self.args.get('atlas_regions', False))
-        for atlas_path in atlas_mod.find_atlas_files(folder):
+        atlas_enabled = bool(self.args.get('atlas_enabled', True))
+        atlas_files = atlas_mod.find_atlas_files(folder) if atlas_enabled else []
+        per_region = atlas_enabled and bool(self.args.get('atlas_regions', False))
+        for atlas_path in atlas_files:
             atlas = atlas_mod.parse_atlas(atlas_path)
             if not atlas.pages:
                 continue
@@ -1012,7 +1029,7 @@ class WorkerThread(QThread):
                 self.sig_progress.emit(prog, f"Extracting {label}: {text}")
 
             try:
-                atlas_files = atlas_mod.find_atlas_files(current_target_dir) if self.args.get('atlas_regions', True) else []
+                atlas_files = atlas_mod.find_atlas_files(current_target_dir) if self.args.get('atlas_enabled', True) else []
                 if atlas_files and not self._has_unity_asset_files(current_target_dir):
                     # A web/atlas game can hold thousands of files that UnityPy would
                     # reject one by one; skip that scan when there is nothing to find.
@@ -1112,40 +1129,48 @@ class WorkerThread(QThread):
             o_page = o_tex.get('atlas_page') or {}
             all_potentials = []
 
-            # ---- Atlas page items: one row per page, pieces compared through signatures ----
+            # ---- Atlas page items: one row per page, pieces compared internally ----
             if o_page:
+                o_strong, o_weak = atlas_keys(o_tex)
                 for m_tex in mod_textures:
                     m_page = m_tex.get('atlas_page') or {}
-                    if not m_page:
-                        continue
-                    stats = atlas_page_stats(o_page, m_page)
-                    if stats.total <= 0:
-                        continue
-                    o_strong, o_weak = atlas_keys(o_tex)
                     m_strong, m_weak = atlas_keys(m_tex)
-                    is_identity = bool(o_weak) and o_weak == m_weak
-                    # plain page similarity (fallback when pieces were renamed) is merged
-                    # with the atlas overlap: a candidate ranks by the better of both, so
-                    # an atlas match of 90% beats a plain match of 50%
+                    is_identity = bool(o_weak) and o_weak == m_weak and bool(m_page)
+                    # plain page similarity is always computed (also for plain images and
+                    # for atlases whose pieces were renamed), then merged with the atlas
+                    # overlap so an atlas match of 90% outranks a plain match of 50%
                     plain_sim = compare_images(o_tex['save_path'], m_tex['save_path'], trim=True)
+                    if m_page:
+                        stats = atlas_page_stats(o_page, m_page)
+                        if stats.total <= 0:
+                            continue
+                        atlas_ratio = stats.ratio
+                        text, detail = stats.summary(), stats.detail()
+                        piece_stats = stats.to_dict()
+                        state = "page"
+                    else:
+                        atlas_ratio = None
+                        text, detail, piece_stats, state = "-", "", {}, "none"
                     all_potentials.append({
-                        'tex': m_tex, 'similarity': max(stats.ratio, plain_sim),
+                        'tex': m_tex,
+                        'similarity': max(plain_sim, atlas_ratio or 0.0),
                         'plain_similarity': plain_sim,
-                        'atlas_ratio': stats.ratio,
+                        'atlas_ratio': atlas_ratio,
                         'is_exact': is_identity,
-                        'is_same_res': (m_page.get('page_size') == o_page.get('page_size')),
-                        'atlas_state': "page",
-                        'atlas_text': stats.summary(),
-                        'atlas_detail': stats.detail(),
+                        'is_same_res': (m_tex.get('width') == o_tex.get('width')
+                                        and m_tex.get('height') == o_tex.get('height')),
+                        'atlas_state': state,
+                        'atlas_text': text,
+                        'atlas_detail': detail,
                         'match_by': "atlas" if is_identity else "sim",
-                        'piece_stats': stats.to_dict(),
+                        'piece_stats': piece_stats,
                     })
                 identity_hits = [p for p in all_potentials if p['is_exact']]
-                if identity_hits:
-                    all_potentials = identity_hits
-                else:
-                    all_potentials.sort(key=lambda x: x['similarity'], reverse=True)
-                    all_potentials = all_potentials[:num_candidates]
+                # plain images and re-named atlases stay available as candidates, ordered by
+                # their similarity; identity hits always come first
+                others = sorted((p for p in all_potentials if not p['is_exact']),
+                                key=lambda x: x['similarity'], reverse=True)[:num_candidates]
+                all_potentials = identity_hits + others
             
             # 1. Name match candidates (including base name to ignore _PathID)
             o_name_lower = o_tex['name'].lower()
@@ -1598,7 +1623,8 @@ class MainWindow(QMainWindow):
         settings.setValue("options/highlight_diff", self.diff_check.isChecked())
         settings.setValue("options/high_quality", self.chk_high_quality.isChecked())
         settings.setValue("options/save_as_original", self.chk_save_original.isChecked())
-        settings.setValue("options/atlas_regions", self.chk_atlas.isChecked())
+        settings.setValue("options/atlas_enabled", self.chk_atlas.isChecked())
+        settings.setValue("options/atlas_regions", self.chk_atlas_region.isChecked())
         settings.setValue("options/scan_all_orig", self.chk_orig_scan_all.isChecked())
         settings.setValue("options/scan_all_mod", self.chk_mod_scan_all.isChecked())
         settings.sync() # Force write to disk immediately
@@ -1642,7 +1668,9 @@ class MainWindow(QMainWindow):
 
             self.chk_save_original.setChecked(get_bool_val("options/save_as_original", "true"))
 
-            self.chk_atlas.setChecked(get_bool_val("options/atlas_regions", "false"))
+            self.chk_atlas.setChecked(get_bool_val("options/atlas_enabled", "true"))
+            self.chk_atlas_region.setChecked(get_bool_val("options/atlas_regions", "false"))
+            self.chk_atlas_region.setEnabled(self.chk_atlas.isChecked())
             
             self.chk_orig_scan_all.setChecked(get_bool_val("options/scan_all_orig", "true"))
             self.chk_mod_scan_all.setChecked(get_bool_val("options/scan_all_mod", "true"))
@@ -1711,12 +1739,19 @@ class MainWindow(QMainWindow):
         opt_row1.addWidget(self.chk_same_res)
 
         opt_row1.addSpacing(10)
-        self.chk_atlas = QCheckBox("Atlas per region")
-        self.chk_atlas.setToolTip("OFF (default): one item per atlas page, similarity = same pieces / all pieces.\n"
-                                  "ON: split every atlas region into its own item (fine-grained, slower).\n"
-                                  "Replacements always land in the ORIGINAL page layout.")
-        self.chk_atlas.setChecked(False)
+        self.chk_atlas = QCheckBox("Check Atlas")
+        self.chk_atlas.setToolTip("ON (default): .atlas pages are handled as atlases - one item per page,\n"
+                                  "similarity = same pieces / all pieces, replacements keep the original layout.\n"
+                                  "OFF: no atlas handling, the page images are matched as ordinary images.")
+        self.chk_atlas.setChecked(True)
+        self.chk_atlas.toggled.connect(self.on_atlas_toggle)
         opt_row1.addWidget(self.chk_atlas)
+
+        self.chk_atlas_region = QCheckBox("Per region")
+        self.chk_atlas_region.setToolTip("Split every atlas region into its own item (fine grained, slower).\n"
+                                         "OFF (default): one item per atlas page.")
+        self.chk_atlas_region.setChecked(False)
+        opt_row1.addWidget(self.chk_atlas_region)
 
         opt_row1.addSpacing(10)
         self.chk_sim_filter = QCheckBox("Cut-off:")
@@ -2250,6 +2285,10 @@ class MainWindow(QMainWindow):
         self.update_buttons()
 
 
+    def on_atlas_toggle(self, checked):
+        """'Per region' only makes sense while atlas handling is enabled."""
+        self.chk_atlas_region.setEnabled(bool(checked) and not self._is_worker_running())
+
     def on_mode_changed(self, mode):
         # Enable Packer only for Unity mode
         self.update_buttons()
@@ -2281,7 +2320,8 @@ class MainWindow(QMainWindow):
                           mode=self.mode_combo.currentText(),
                           orig_scan_all=self.chk_orig_scan_all.isChecked(),
                           mod_scan_all=self.chk_mod_scan_all.isChecked(),
-                          atlas_regions=self.chk_atlas.isChecked())
+                          atlas_enabled=self.chk_atlas.isChecked(),
+                          atlas_regions=(self.chk_atlas.isChecked() and self.chk_atlas_region.isChecked()))
 
     def on_extraction_finished(self, data):
         self.orig_textures = data['orig']
@@ -3529,6 +3569,7 @@ class MainWindow(QMainWindow):
         self.txt_sim_cutoff.setEnabled(not is_running and self.chk_sim_filter.isChecked())
         self.chk_same_res.setEnabled(not is_running)
         self.chk_atlas.setEnabled(not is_running)
+        self.chk_atlas_region.setEnabled(not is_running and self.chk_atlas.isChecked())
         self.diff_check.setEnabled(not is_running)
         self.chk_show_log.setEnabled(not is_running)
         self.btn_toggle_expand.setEnabled(has_results and not is_running)
