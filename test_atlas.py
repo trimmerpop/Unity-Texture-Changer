@@ -197,6 +197,37 @@ def test_trim_normalization(fixture):
           hash_a is not None and hash_b is not None and similarity.hamming_similarity(hash_a, hash_b) == 1.0)
 
 
+def test_page_digests(fixture):
+    """Page level comparison: same pieces / all pieces, without decoding pages again."""
+    page = Image.open(os.path.join(fixture, "page.png")).convert("RGBA")
+    parsed = atlas_mod.parse_atlas(os.path.join(fixture, "flat.atlas"))
+    regions = parsed.pages[0].regions
+    digests = atlas_mod.page_piece_digests(page, regions)
+    check("digests: one entry per region", len(digests) == len(regions), (len(digests), len(regions)))
+
+    same = atlas_mod.compare_piece_digests(digests, digests, regions, regions)
+    check("digests: identical pages -> ratio 1.0", same.ratio == 1.0 and same.changed == 0, same.to_dict())
+    check("digests: summary text", same.summary().endswith("same") and str(len(regions)) in same.summary(),
+          same.summary())
+
+    changed_page = page.copy()
+    changed_page.paste(Image.new("RGBA", (4, 4), (1, 2, 3, 255)), (21, 21))  # inside the r270 block
+    changed = atlas_mod.page_piece_digests(changed_page, regions)
+    diff = atlas_mod.compare_piece_digests(digests, changed, regions, regions)
+    check("digests: one changed piece lowers the ratio", diff.changed == 1 and diff.ratio < 1.0, diff.to_dict())
+
+    partial = dict(digests)
+    partial.pop(next(iter(partial)))
+    stats = atlas_mod.compare_piece_digests(digests, partial, regions, regions)
+    check("digests: pieces missing in the other build are counted", stats.missing == 1, stats.to_dict())
+
+    extra = dict(digests)
+    extra["ghost"] = "0" * 32
+    stats = atlas_mod.compare_piece_digests(digests, extra, regions, regions)
+    check("digests: extra pieces are counted in the denominator",
+          stats.extra == 1 and stats.total == len(digests) + 1, stats.to_dict())
+
+
 def read_config_paths():
     paths = {}
     config_path = os.path.join(PROJECT, "config.ini")
@@ -330,6 +361,8 @@ def main():
         test_write_back(fixture)
         print("== trim normalization ==")
         test_trim_normalization(fixture)
+        print("== page digests ==")
+        test_page_digests(fixture)
         print("== real data ==")
         test_real_data()
     finally:

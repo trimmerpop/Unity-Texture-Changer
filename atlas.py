@@ -27,6 +27,7 @@ the page, so it is restored with ROTATE_270 (a clockwise quarter turn). This was
 verified against real builds: unpacking orig/mod with that direction makes the same
 region pixel-identical (MSE 0.0) in 142 of 147 rotation-mismatch cases.
 """
+import hashlib
 import os
 import re
 from dataclasses import dataclass, field
@@ -392,6 +393,105 @@ def region_key(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "")).strip().lower()
 
 
+def piece_digest(image: Image.Image) -> str:
+    """md5 of the upright region pixels, used to compare pieces between builds."""
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    return hashlib.md5(image.tobytes()).hexdigest()
+
+
+def page_piece_digests(page_image: Image.Image, regions: Sequence[AtlasRegion]) -> Dict[str, str]:
+    """Maps region_key(name) -> digest for every piece of a page."""
+    digests: Dict[str, str] = {}
+    for region in regions:
+        if not region.width or not region.height:
+            continue
+        try:
+            digests[region_key(region.name)] = piece_digest(unpack_region(page_image, region))
+        except Exception:
+            continue
+    return digests
+
+
+@dataclass
+class PageStats:
+    """Piece level comparison of two atlas pages."""
+    pieces: int = 0
+    identical: int = 0
+    changed: int = 0
+    missing: int = 0
+    extra: int = 0
+    moved: int = 0
+    rotated: int = 0
+    trimmed: int = 0
+
+    @property
+    def total(self) -> int:
+        """Denominator for the overlap ratio (the bigger of both pages)."""
+        return max(self.pieces + self.missing, self.pieces + self.extra)
+
+    @property
+    def ratio(self) -> float:
+        """same pieces / total pieces, i.e. how much of the page is unchanged."""
+        if self.total <= 0:
+            return 0.0
+        return self.identical / self.total
+
+    def to_dict(self) -> dict:
+        return {"pieces": self.pieces, "identical": self.identical, "changed": self.changed,
+                "missing": self.missing, "extra": self.extra, "moved": self.moved,
+                "rotated": self.rotated, "trimmed": self.trimmed,
+                "ratio": round(self.ratio, 4)}
+
+    def summary(self) -> str:
+        """Short text for the Atlas column."""
+        return f"{self.total}p / {self.identical} same"
+
+    def detail(self) -> str:
+        """Tooltip text."""
+        lines = [f"{self.identical} of {self.total} pieces identical ({self.ratio * 100:.1f}%)"]
+        if self.changed:
+            lines.append(f"changed: {self.changed}")
+        if self.missing:
+            lines.append(f"only in original: {self.missing}")
+        if self.extra:
+            lines.append(f"only in modified: {self.extra}")
+        if self.moved or self.rotated or self.trimmed:
+            lines.append(f"re-packed: moved {self.moved}, rotated {self.rotated}, trimmed {self.trimmed}")
+        return "\n".join(lines)
+
+
+def compare_piece_digests(orig_digests: Dict[str, str], mod_digests: Dict[str, str],
+                          orig_regions: Sequence[AtlasRegion] = (),
+                          mod_regions: Sequence[AtlasRegion] = ()) -> PageStats:
+    """Compares two pages piece by piece using their digests (no page decoding needed)."""
+    stats = PageStats()
+    orig_by = {region_key(r.name): r for r in orig_regions}
+    mod_by = {region_key(r.name): r for r in mod_regions}
+    for key, digest in orig_digests.items():
+        want = mod_digests.get(key)
+        if want is None:
+            stats.missing += 1
+            continue
+        stats.pieces += 1
+        if digest == want:
+            stats.identical += 1
+        else:
+            stats.changed += 1
+        a, b = orig_by.get(key), mod_by.get(key)
+        if a and b:
+            if (a.width, a.height) != (b.width, b.height):
+                stats.trimmed += 1
+            elif a.rotate != b.rotate:
+                stats.rotated += 1
+            elif (a.x, a.y) != (b.x, b.y):
+                stats.moved += 1
+    for key in mod_digests:
+        if key not in orig_digests:
+            stats.extra += 1
+    return stats
+
+
 def load_page_image(page_path: str) -> Optional[Image.Image]:
     """Loads an atlas page as RGBA, or None when it cannot be read."""
     try:
@@ -459,6 +559,77 @@ def extract_atlas_regions(atlas_path: str, out_dir: str, log_callback=None) -> L
                 "atlas": region.to_metadata(atlas_path, page_path),
             })
         log(f"  [ATLAS] {os.path.basename(atlas_path)}: {len(page.regions)} regions on {page.name}")
+    return entries
+
+
+def extract_atlas_pages(atlas_path: str, out_dir: str, preview_max: int = 1024,
+                        log_callback=None) -> List[dict]:
+    """One metadata entry per atlas page (no per-piece files).
+
+    The page is offered as a single item, and the pieces are compared internally through
+    their digests: `similarity = identical pieces / total pieces`, computed by
+    compare_piece_digests() without decoding the pages again.
+    """
+    def log(message):
+        if log_callback:
+            log_callback(message)
+
+    entries: List[dict] = []
+    try:
+        atlas = parse_atlas(atlas_path)
+    except Exception as error:
+        log(f"  [ATLAS] Failed to parse {os.path.basename(atlas_path)}: {error}")
+        return entries
+    if not atlas.pages:
+        return entries
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    stem = os.path.splitext(os.path.basename(atlas_path))[0]
+    for page in atlas.pages:
+        page_path = atlas.page_path(page)
+        page_image = load_page_image(page_path)
+        if page_image is None:
+            log(f"  [ATLAS] Page image missing/unreadable: {page.name}")
+            continue
+        page.width, page.height = page_image.size
+        digests = page_piece_digests(page_image, page.regions)
+
+        preview = page_image
+        if max(preview.size) > preview_max:
+            preview = preview.copy()
+            preview.thumbnail((preview_max, preview_max), Image.Resampling.BOX)
+        page_stem = os.path.splitext(os.path.basename(page.name))[0]
+        safe_stem = re.sub(r'[\\/:*?"<>|]', "_", page_stem).strip() or "page"
+        name = stem if len(atlas.pages) == 1 else f"{stem}__{safe_stem}"
+        file_name = f"{re.sub(r'[\\/:*?\"<>|]', '_', name)}.png"
+        save_path = os.path.join(out_dir, file_name)
+        try:
+            preview.save(save_path, format="PNG")
+        except Exception as error:
+            log(f"  [ATLAS] Could not write preview for {page.name}: {error}")
+            continue
+        entries.append({
+            "name": name,
+            "file": file_name,
+            "save_path": save_path,
+            "width": page.width,
+            "height": page.height,
+            # the item's Size column shows the real page file, not the small preview
+            "size": os.path.getsize(page_path) if os.path.exists(page_path) else os.path.getsize(save_path),
+            "source_asset": atlas_path,
+            "atlas_page": {
+                "kind": "atlas-page",
+                "atlas_file": atlas_path,
+                "page_file": page_path,
+                "page_size": [page.width, page.height],
+                "pieces": len(digests),
+                "pma": page.pma,
+                "scale": page.scale,
+                "digests": digests,
+            },
+        })
+        log(f"  [ATLAS] {os.path.basename(atlas_path)}: page {page.name} -> {len(digests)} pieces (1 item)")
     return entries
 
 
