@@ -170,6 +170,33 @@ def test_write_back(fixture):
           packed.size == (region.packed_width, region.packed_height), packed.size)
 
 
+def test_trim_normalization(fixture):
+    """compare_images(trim=True) must ignore transparent padding (atlas trim differences)."""
+    import similarity
+
+    folder = os.path.join(fixture, "trim")
+    os.makedirs(folder, exist_ok=True)
+    part = Image.new("RGBA", (20, 10), (10, 200, 30, 255))
+    base = Image.new("RGBA", (40, 20), (0, 0, 0, 0))
+    base.paste(part, (5, 5))
+    padded = Image.new("RGBA", (70, 50), (0, 0, 0, 0))
+    padded.paste(base, (15, 25))  # same artwork, different transparent border
+    path_a = os.path.join(folder, "a.png")
+    path_b = os.path.join(folder, "b.png")
+    base.save(path_a, format="PNG")
+    padded.save(path_b, format="PNG")
+
+    raw = similarity.compare_images(path_a, path_b)
+    trimmed = similarity.compare_images(path_a, path_b, trim=True)
+    check("trim: raw comparison is penalised by the padding", raw < 0.99, raw)
+    check("trim: normalized comparison is 1.0", trimmed >= 0.999, trimmed)
+
+    hash_a = similarity.get_image_hash(path_a, trim=True)
+    hash_b = similarity.get_image_hash(path_b, trim=True)
+    check("trim: hashes match after trimming",
+          hash_a is not None and hash_b is not None and similarity.hamming_similarity(hash_a, hash_b) == 1.0)
+
+
 def read_config_paths():
     paths = {}
     config_path = os.path.join(PROJECT, "config.ini")
@@ -301,6 +328,8 @@ def main():
         test_transforms(fixture)
         print("== write back ==")
         test_write_back(fixture)
+        print("== trim normalization ==")
+        test_trim_normalization(fixture)
         print("== real data ==")
         test_real_data()
     finally:

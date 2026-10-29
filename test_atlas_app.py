@@ -150,6 +150,46 @@ def test_end_to_end():
               f"{len(atlas_exact)}/{len(matched)} marked exact")
         check("match: pma flag propagated for apply", all("match_pma" in r for r in matched))
 
+        states = [r.get("atlas_state") for r in matched]
+        counts = {state: states.count(state) for state in set(states)}
+        print(f"  info  geometry states: {counts}")
+        check("match: geometry state recorded for every pair",
+              all(state in ("same", "moved", "rotated", "resized") for state in states), counts)
+        check("match: moved/rotated pairings are reported",
+              any(state in ("moved", "rotated") for state in states), counts)
+        check("match: atlas identity is the matching reason",
+              all(r.get("match_by") == "atlas" for r in matched),
+              {r.get("match_by") for r in matched})
+
+        resized = [r for r in matched if r.get("atlas_state") == "resized"]
+        if resized:
+            # the reported score must be the trim-normalised one: recompute a sample pair
+            import similarity as sim_mod
+            sample = resized[0]
+            raw = sim_mod.compare_images(sample["original"]["save_path"], sample["match_file"])
+            trim = sim_mod.compare_images(sample["original"]["save_path"], sample["match_file"], trim=True)
+            print(f"  info  trim differs on {len(resized)} pairs (mean reported "
+                  f"{sum(r['best_similarity'] for r in resized) / len(resized):.4f}); "
+                  f"sample raw={raw:.4f} trim={trim:.4f}")
+            check("match: reported score is the trim-normalised one",
+                  abs(sample["best_similarity"] - trim) <= max(0.02, abs(trim - raw)), 
+                  (sample["best_similarity"], trim, raw))
+
+        print("== UI column ==")
+        try:
+            window = app_main.MainWindow()
+            window.results = results
+            window.update_tree(show_progress=False)
+            top = window.tree.topLevelItem(0)
+            check("ui: Atlas column exists", window.tree.columnCount() == 11, window.tree.columnCount())
+            check("ui: Atlas cell is filled", bool(top.text(10)) and top.text(10) != "", top.text(10))
+            check("ui: Atlas tooltip explains the packing", "rect" in top.toolTip(10), top.toolTip(10)[:60])
+            check("ui: Similarity tooltip mentions trim", "Trim" in top.toolTip(4) or "trim" in top.toolTip(4),
+                  top.toolTip(4)[:60])
+            window.close()
+        except Exception as error:
+            check(f"ui: tree rendering ({type(error).__name__})", False, str(error))
+
         print("== apply ==")
         before = {}
         for res in matched:
@@ -190,8 +230,9 @@ def test_end_to_end():
             got = after.crop((x, y, x + w, y + h))
             check(f"apply: region '{res['original']['name']}' written at the original rect",
                   images_equal(want, got))
+            replaced = {res["original"]["atlas"]["region"] for res in to_replace}
             others = [r for r in atlas_mod.parse_atlas(meta["atlas_file"]).pages[0].regions
-                      if atlas_mod.region_key(r.name) != atlas_mod.region_key(meta["region"])]
+                      if r.name not in replaced]
             if others:
                 other = others[0]
                 check(f"apply: untouched region '{other.name}' unchanged",

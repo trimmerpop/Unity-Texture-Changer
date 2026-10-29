@@ -72,13 +72,37 @@ def ensure_grayscale(img):
         return gray
     return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) # Fallback
 
-def get_image_hash(image_path):
+def trim_to_content(img, threshold=10):
+    """Crops fully transparent borders, keeping the visible sprite content.
+
+    Atlas sprites are trimmed by the packer, and two builds of the same sprite often end
+    up with a few pixels of difference in that trim (e.g. 1461x348 vs 1468x364). Comparing
+    the raw crops then squashes the artwork and drops a perfect match to ~0.5, which is why
+    region comparisons are done on the trimmed content instead.
+    """
+    if img is None:
+        return None
+    if len(img.shape) != 3 or img.shape[2] != 4:
+        return img  # no alpha channel -> nothing to trim
+    mask = img[:, :, 3] > threshold
+    if not mask.any():
+        return img
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    return img[rows[0]:rows[-1] + 1, cols[0]:cols[-1] + 1]
+
+
+def get_image_hash(image_path, trim=False):
     """Calculates a perceptual hash for the image."""
     try:
         # Load as-is first then convert to grayscale strictly
         img = load_image(image_path)
         if img is None:
             return None
+        if trim:
+            img = trim_to_content(img)
+            if img is None:
+                return None
         
         gray = ensure_grayscale(img)
         gray = cv2.resize(gray, (16, 16), interpolation=cv2.INTER_AREA)
@@ -97,14 +121,25 @@ def hamming_similarity(hash1, hash2):
     hash2 = np.array(hash2)
     return 1.0 - (np.count_nonzero(hash1 != hash2) / len(hash1))
 
-def compare_images(img1_path, img2_path):
-    """Deep comparison of two images using MSE and SSIM."""
+def compare_images(img1_path, img2_path, trim=False):
+    """Deep comparison of two images using MSE and SSIM.
+
+    trim=True compares only the visible (alpha trimmed) content, which keeps atlas regions
+    comparable when their packing trim differs between builds. The score is only used for
+    matching, so a normalized comparison is the honest number for those pairs.
+    """
     try:
         img1 = load_image(img1_path)
         img2 = load_image(img2_path)
         
         if img1 is None or img2 is None:
             return 0.0
+
+        if trim:
+            img1 = trim_to_content(img1)
+            img2 = trim_to_content(img2)
+            if img1 is None or img2 is None:
+                return 0.0
             
         # Standardize color space (ensure both are BGR/BGRA or Gray)
         # Resize img2 to match img1 if needed

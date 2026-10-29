@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QTableWidgetItem, QHeaderView, QCheckBox, QProgressBar, QMenu,
                              QMessageBox, QInputDialog, QDialog, QListWidget, QListWidgetItem,
                              QPlainTextEdit, QTreeWidget, QTreeWidgetItem, QComboBox, QSplitter, QFrame)
-from PyQt6.QtGui import QIcon, QAction, QDragEnterEvent, QDropEvent, QMouseEvent, QWheelEvent, QPixmap, QImage, QPainter, QPen, QFontMetrics
+from PyQt6.QtGui import QIcon, QAction, QDragEnterEvent, QDropEvent, QMouseEvent, QWheelEvent, QPixmap, QImage, QPainter, QPen, QFontMetrics, QColor, QBrush
 from PIL import Image
 from asset_manager import AssetManager, SUPPORTED_IMAGE_EXTS, convert_image_format
 from similarity import get_image_hash, hamming_similarity, compare_images, load_image
@@ -249,6 +249,48 @@ def atlas_keys(texture):
     page_name = os.path.basename(meta.get('page_file') or "")
     strong = f"{atlas_name or page_name}|{region}"
     return strong, region
+
+
+def atlas_geometry(orig_tex, match_tex):
+    """Compares how two builds packed the same atlas region.
+
+    Returns (state, short_text, detail) with state in {"same", "moved", "rotated",
+    "resized", "none"}. Region comparison happens after unpacking, so the packing
+    position/rotation does not affect the score at all; only a different trim (sprite
+    size) squeezes the artwork and lowers the similarity. short_text fills the "Atlas"
+    column, detail is the tooltip.
+    """
+    a = orig_tex.get('atlas') or {}
+    b = match_tex.get('atlas') or {}
+    if not a.get('region') or not b.get('region'):
+        return "none", "-", ""
+
+    a_size = tuple(a.get('sprite_size') or ())
+    b_size = tuple(b.get('sprite_size') or ())
+    a_rot, b_rot = int(a.get('rotate', 0)), int(b.get('rotate', 0))
+    a_rect = tuple(a.get('rect') or ())
+    b_rect = tuple(b.get('rect') or ())
+
+    if a_size and b_size and a_size != b_size:
+        state = "resized"
+        short = f"trim {a_size[0]}x{a_size[1]} -> {b_size[0]}x{b_size[1]}"
+        delta = "different trim: the sprite is packed slightly differently"
+    elif a_rot != b_rot:
+        state = "rotated"
+        short = f"rot {a_rot} -> {b_rot}"
+        delta = "packed with another rotation"
+    elif a_rect and b_rect and a_rect != b_rect:
+        state = "moved"
+        short = "moved"
+        delta = "packed at another position"
+    else:
+        state = "same"
+        short = "same"
+        delta = "same rect and rotation"
+
+    detail = (f"{delta}\norig {os.path.basename(a.get('page_file', ''))} rect{a_rect} rot{a_rot}\n"
+              f"mod  {os.path.basename(b.get('page_file', ''))} rect{b_rect} rot{b_rot}")
+    return state, short, detail
 
 class EnhancedTreeWidget(QTreeWidget):
     """QTreeWidget subclass that supports shortcuts like Space, Delete, and keypad +/-."""
@@ -899,13 +941,16 @@ class WorkerThread(QThread):
                 continue
             if 'hash' not in tex:
                 try:
-                    tex['hash'] = get_image_hash(tex['save_path'])
+                    # trim-normalised hash for atlas regions: the packing trim differs
+                    # between builds and would otherwise scatter the candidate ranking
+                    tex['hash'] = get_image_hash(tex['save_path'], trim=bool(atlas_keys(tex)[0]))
                 except: continue
             if i % 20 == 0:
                 self.sig_progress.emit(int((i/total_mod)*100), f"Hashing Modified {i}/{total_mod}...")
 
         self.sig_log.emit("Matching textures...")
         results = []
+        atlas_summary = {"paired": 0, "same": 0, "moved": 0, "rotated": 0, "resized": 0}
         for i, o_tex in enumerate(orig_textures):
             if 'save_path' not in o_tex:
                 self.sig_log.emit(f"Warning: Missing 'save_path' for texture '{o_tex.get('name', 'Unknown')}'. Skipping.")
@@ -915,18 +960,19 @@ class WorkerThread(QThread):
                 self.sig_log.emit(f"Warning: File not found: {o_tex['save_path']}. Skipping.")
                 continue
 
-            try:
-                o_tex['hash'] = get_image_hash(o_tex['save_path'])
-            except Exception as e:
-                self.sig_log.emit(f"Error hashing {o_tex['save_path']}: {e}")
-                continue
-            
             candidate_pool = {} # save_path -> m_tex
             
             # 1. Name match candidates (including base name to ignore _PathID)
             o_name_lower = o_tex['name'].lower()
             o_base_lower = get_base_name(o_tex['name']).lower()
             o_atlas_strong, o_atlas_weak = atlas_keys(o_tex)
+            is_atlas_item = bool(o_atlas_strong)
+            
+            try:
+                o_tex['hash'] = get_image_hash(o_tex['save_path'], trim=is_atlas_item)
+            except Exception as e:
+                self.sig_log.emit(f"Error hashing {o_tex['save_path']}: {e}")
+                continue
             
             for m_tex in mod_textures:
                 m_atlas_strong, m_atlas_weak = atlas_keys(m_tex)
@@ -942,7 +988,9 @@ class WorkerThread(QThread):
             # 2. Similarity based candidates
             scores = []
             for m_tex in mod_textures:
-                if same_res and (o_tex.get('width') != m_tex.get('width') or o_tex.get('height') != m_tex.get('height')):
+                # atlas regions are identified by name/region, so a differing trim size
+                # (the same sprite packed a bit differently) must not exclude them
+                if same_res and not is_atlas_item and (o_tex.get('width') != m_tex.get('width') or o_tex.get('height') != m_tex.get('height')):
                     continue
                 sim = hamming_similarity(o_tex['hash'], m_tex['hash'])
                 scores.append((sim, m_tex))
@@ -954,17 +1002,21 @@ class WorkerThread(QThread):
             # Refine all candidates in the pool
             all_potentials = []
             for m_tex in candidate_pool.values():
-                refined_sim = compare_images(o_tex['save_path'], m_tex['save_path'])
+                # trim-normalised comparison for atlas regions (see similarity.trim_to_content)
+                refined_sim = compare_images(o_tex['save_path'], m_tex['save_path'], trim=is_atlas_item)
                 m_atlas_strong, m_atlas_weak = atlas_keys(m_tex)
                 is_atlas_pair = bool(o_atlas_strong) and (
                     m_atlas_strong == o_atlas_strong or (bool(o_atlas_weak) and m_atlas_weak == o_atlas_weak)
                 )
                 is_exact = is_atlas_pair or (m_tex['name'].lower() == o_tex['name'].lower())
+                geo_state, geo_text, geo_detail = atlas_geometry(o_tex, m_tex)
 
                 is_same_res = (m_tex.get('width') == o_tex.get('width') and m_tex.get('height') == o_tex.get('height'))
                 all_potentials.append({
                     'tex': m_tex, 'similarity': refined_sim, 
-                    'is_exact': is_exact, 'is_same_res': is_same_res
+                    'is_exact': is_exact, 'is_same_res': is_same_res,
+                    'atlas_state': geo_state, 'atlas_text': geo_text, 'atlas_detail': geo_detail,
+                    'match_by': "atlas" if is_atlas_pair else ("name" if is_exact else "sim"),
                 })
             
             if not all_potentials:
@@ -985,9 +1037,13 @@ class WorkerThread(QThread):
 
             # 2. Identify "ABSOLUTE BEST" Candidate using Similarity/Name/Res priority from the FILTERED list 
             def best_sort_key(x):
-                # Priority: 1.0 Similarity (is_perfect) > name match (is_exact) > resolution match (is_same_res) > high similarity (similarity)
+                # Priority: atlas identity > 1.0 Similarity (is_perfect) > name match (is_exact)
+                # > resolution match (is_same_res) > high similarity (similarity)
+                # Atlas identity is a structural key (same region of the same atlas), so it
+                # must win over a coincidental 1.0 of some other region with identical art.
+                is_atlas = 1 if x.get('match_by') == "atlas" else 0
                 is_perfect = (x['similarity'] >= 1.0)
-                return (1 if is_perfect else 0, 1 if x['is_exact'] else 0, 1 if x['is_same_res'] else 0, x['similarity'])
+                return (is_atlas, 1 if is_perfect else 0, 1 if x['is_exact'] else 0, 1 if x['is_same_res'] else 0, x['similarity'])
             
             best_candidate = max(final_refined, key=best_sort_key)
             best_match_path = best_candidate['tex']['save_path']
@@ -1013,6 +1069,10 @@ class WorkerThread(QThread):
                     "is_exact": r['is_exact'],
                     "is_same_res": r['is_same_res'],
                     "pma": bool((m_t.get('atlas') or {}).get('pma')),
+                    "atlas_state": r['atlas_state'],
+                    "atlas_text": r['atlas_text'],
+                    "atlas_detail": r['atlas_detail'],
+                    "match_by": r['match_by'],
                 })
             if not IsAddedBestCandidate:
                 if len(candidates) >= num_candidates:
@@ -1028,6 +1088,10 @@ class WorkerThread(QThread):
                     "is_exact": best_candidate['is_exact'],
                     "is_same_res": best_candidate['is_same_res'],
                     "pma": bool((m_t.get('atlas') or {}).get('pma')),
+                    "atlas_state": best_candidate['atlas_state'],
+                    "atlas_text": best_candidate['atlas_text'],
+                    "atlas_detail": best_candidate['atlas_detail'],
+                    "match_by": best_candidate['match_by'],
                 })
 
             # Unchecked Same/Cut-off logic
@@ -1047,12 +1111,26 @@ class WorkerThread(QThread):
                 "match_pma": bool((best_candidate['tex'].get('atlas') or {}).get('pma')),
                 "best_similarity": best_similarity,
                 "candidates": candidates,
+                # how the two builds packed this region + reason of the pairing
+                "atlas_state": best_candidate['atlas_state'],
+                "atlas_text": best_candidate['atlas_text'],
+                "atlas_detail": best_candidate['atlas_detail'],
+                "match_by": best_candidate['match_by'],
                 "replace": should_replace
             })
+            if best_candidate['match_by'] == "atlas":
+                atlas_summary["paired"] += 1
+                if best_candidate['atlas_state'] in atlas_summary:
+                    atlas_summary[best_candidate['atlas_state']] += 1
             
             total = len(orig_textures)
             if i % 10 == 0:
                 self.sig_progress.emit(int((i/total)*100), f"Matching {i}/{total}...")
+
+        if atlas_summary["paired"]:
+            self.sig_log.emit(f"Atlas identity matches: {atlas_summary['paired']} "
+                              f"(same {atlas_summary['same']} / moved {atlas_summary['moved']} / "
+                              f"rotated {atlas_summary['rotated']} / resized {atlas_summary['resized']})")
         
         self.sig_finished.emit(results)
 
@@ -1562,9 +1640,9 @@ class MainWindow(QMainWindow):
         
         # Tree for results (Using EnhancedTreeWidget for Space bar support)
         self.tree = EnhancedTreeWidget()
-        self.tree.setColumnCount(10)
+        self.tree.setColumnCount(11)
         self.tree.setHeaderLabels([
-            "Replace", "Name", "Res", "Size", "Similarity", "Assets", "PathID", "Match File", "M-Res", "M-Size"
+            "Replace", "Name", "Res", "Size", "Similarity", "Assets", "PathID", "Match File", "M-Res", "M-Size", "Atlas"
         ])
         
         # --- UI Styling ---
@@ -1593,6 +1671,7 @@ class MainWindow(QMainWindow):
         # All columns are interactive
         self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.tree.header().setStretchLastSection(False)
+        self.tree.setColumnWidth(10, 150)  # Atlas (packing geometry of the matched region)
         
         # Set alignment for numeric headers
         for i in [2, 3, 4, 6, 8, 9]:
@@ -2339,6 +2418,9 @@ class MainWindow(QMainWindow):
             if p_id is not None and p_id != '':
                 item.setText(6, str(p_id))
 
+            # Atlas column: packing geometry of the matched region ("-" for plain images)
+            self._apply_atlas_cell(item, res.get('atlas_state'), res.get('atlas_text'), res.get('atlas_detail'))
+
             # Right-align numeric columns (Original)
             for col in [2, 3, 4, 6]:
                 item.setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -2386,6 +2468,8 @@ class MainWindow(QMainWindow):
                     c_item.setText(2, f"{cand.get('width', 0)}x{cand.get('height', 0)}")
                     c_item.setText(3, f"{cand.get('size', 0)/1024:.1f} KB")
                     c_item.setText(4, f"{c_sim:.4f}")
+                    self._apply_atlas_cell(c_item, cand.get('atlas_state'), cand.get('atlas_text'),
+                                           cand.get('atlas_detail'))
 
                     # Right-align numeric columns (Candidate)
                     for col in [2, 3, 4]:
@@ -2433,6 +2517,26 @@ class MainWindow(QMainWindow):
         finally:
             self._is_syncing_widths = False
 
+    def _apply_atlas_cell(self, item, state, text, detail):
+        """Renders how the two builds packed an atlas region in the "Atlas" column."""
+        colors = {
+            "same": QColor(76, 175, 80),      # green
+            "moved": QColor(255, 179, 0),     # amber: still the same sprite
+            "rotated": QColor(255, 179, 0),
+            "resized": QColor(244, 81, 30),   # orange: trim differs, score is squeezed
+            "none": QColor(150, 150, 150),
+        }
+        state = state or "none"
+        item.setText(10, text or "-")
+        item.setForeground(10, QBrush(colors.get(state, colors["none"])))
+        tip = detail or ""
+        if state == "resized":
+            tip += "\n\nThe trim differs between the builds; the similarity above is trim-normalised."
+        elif state in ("moved", "rotated"):
+            tip += "\n\nPacking position/rotation does not affect the similarity, the regions are compared upright."
+        if tip:
+            item.setToolTip(10, tip)
+
     def _update_item_match_cols(self, item, match_tex, similarity):
         res_data = item.data(1, Qt.ItemDataRole.UserRole)
         orig = res_data['original']
@@ -2442,6 +2546,26 @@ class MainWindow(QMainWindow):
         item.setText(7, os.path.basename(match_tex.get('save_path', 'Unknown')))
         item.setText(8, f"{match_tex.get('width', 0)}x{match_tex.get('height', 0)}")
         item.setText(9, f"{match_tex.get('size', 0)/1024:.1f} KB")
+
+        # Atlas column: how the two builds packed this region (only for atlas items)
+        atlas_state = match_tex.get('atlas_state')
+        atlas_text = match_tex.get('atlas_text')
+        atlas_detail = match_tex.get('atlas_detail')
+        if not atlas_state:
+            for cand in (res_data.get('candidates') or []):
+                if cand.get('save_path') == match_tex.get('save_path'):
+                    atlas_state = cand.get('atlas_state')
+                    atlas_text = cand.get('atlas_text')
+                    atlas_detail = cand.get('atlas_detail')
+                    break
+        if not atlas_state:
+            atlas_state = res_data.get('atlas_state')
+            atlas_text = res_data.get('atlas_text')
+            atlas_detail = res_data.get('atlas_detail')
+        self._apply_atlas_cell(item, atlas_state, atlas_text, atlas_detail)
+        if (orig.get('atlas') or {}).get('region'):
+            item.setToolTip(4, "Trim-normalised similarity (transparent borders ignored)\n"
+                               f"matched by: {res_data.get('match_by', 'sim')}")
 
         # Right-align numeric columns (Match update)
         # 4: Similarity, 6: PathID, 8: M-Res, 9: M-Size
@@ -3253,6 +3377,9 @@ class MainWindow(QMainWindow):
             return False
             
         try:
+            # atlas regions keep their identity/packing info, so trim their comparison too
+            is_atlas_item = bool(atlas_keys(orig)[0])
+
             # 1. Update metadata from the new file
             with Image.open(path) as img:
                 orig['width'] = img.width
@@ -3261,7 +3388,7 @@ class MainWindow(QMainWindow):
             
             # 2. Calculate new perceptual hash
             from similarity import get_image_hash
-            orig['hash'] = get_image_hash(path)
+            orig['hash'] = get_image_hash(path, trim=is_atlas_item)
             if orig['hash'] is None:
                 self.log(f"  Error: Failed to calculate hash for {path}")
                 return False
@@ -3274,11 +3401,12 @@ class MainWindow(QMainWindow):
             # Ensure all mods have hashes for comparison
             for m_tex in self.mod_textures:
                 if 'hash' not in m_tex:
-                    m_tex['hash'] = get_image_hash(m_tex.get('save_path'))
+                    m_tex['hash'] = get_image_hash(m_tex.get('save_path'), trim=bool(atlas_keys(m_tex)[0]))
 
             candidate_pool = {}
             o_name_lower = orig['name'].lower()
             o_base_lower = get_base_name(orig['name']).lower()
+            o_atlas_strong, o_atlas_weak = atlas_keys(orig)
             
             same_res = self.chk_same_res.isChecked()
             filter_enabled = self.chk_sim_filter.isChecked()
@@ -3290,11 +3418,15 @@ class MainWindow(QMainWindow):
                 sim_cutoff = 0.5
                 num_candidates = 5
 
-            # Name matching
+            # Name / atlas identity matching
             for m_tex in self.mod_textures:
-                if m_tex.get('name', '').lower() == o_name_lower or get_base_name(m_tex.get('name', '')).lower() == o_base_lower:
+                m_atlas_strong, m_atlas_weak = atlas_keys(m_tex)
+                is_atlas_pair = bool(o_atlas_strong) and (
+                    m_atlas_strong == o_atlas_strong or (bool(o_atlas_weak) and m_atlas_weak == o_atlas_weak)
+                )
+                if is_atlas_pair or m_tex.get('name', '').lower() == o_name_lower or get_base_name(m_tex.get('name', '')).lower() == o_base_lower:
                     candidate_pool[m_tex['save_path']] = m_tex
-                elif same_res and (orig.get('width') != m_tex.get('width') or orig.get('height') != m_tex.get('height')):
+                elif same_res and not is_atlas_item and (orig.get('width') != m_tex.get('width') or orig.get('height') != m_tex.get('height')):
                     continue
             
             # Hash matching
@@ -3302,7 +3434,7 @@ class MainWindow(QMainWindow):
             from similarity import hamming_similarity
             for m_tex in self.mod_textures:
                 if 'hash' not in m_tex or m_tex['hash'] is None: continue
-                if same_res and (orig.get('width') != m_tex.get('width') or orig.get('height') != m_tex.get('height')):
+                if same_res and not is_atlas_item and (orig.get('width') != m_tex.get('width') or orig.get('height') != m_tex.get('height')):
                     continue
                 sim = hamming_similarity(orig['hash'], m_tex['hash'])
                 scores.append((sim, m_tex))
@@ -3315,12 +3447,19 @@ class MainWindow(QMainWindow):
             all_potentials = []
             from similarity import compare_images
             for m_tex in candidate_pool.values():
-                refined_sim = compare_images(orig['save_path'], m_tex['save_path'])
-                is_exact = (m_tex.get('name', '').lower() == o_name_lower)
+                refined_sim = compare_images(orig['save_path'], m_tex['save_path'], trim=is_atlas_item)
+                m_atlas_strong, m_atlas_weak = atlas_keys(m_tex)
+                is_atlas_pair = bool(o_atlas_strong) and (
+                    m_atlas_strong == o_atlas_strong or (bool(o_atlas_weak) and m_atlas_weak == o_atlas_weak)
+                )
+                is_exact = is_atlas_pair or (m_tex.get('name', '').lower() == o_name_lower)
+                geo_state, geo_text, geo_detail = atlas_geometry(orig, m_tex)
                 is_same_res = (m_tex.get('width') == orig.get('width') and m_tex.get('height') == orig.get('height'))
                 all_potentials.append({
                     'tex': m_tex, 'similarity': refined_sim, 
-                    'is_exact': is_exact, 'is_same_res': is_same_res
+                    'is_exact': is_exact, 'is_same_res': is_same_res,
+                    'atlas_state': geo_state, 'atlas_text': geo_text, 'atlas_detail': geo_detail,
+                    'match_by': "atlas" if is_atlas_pair else ("name" if is_exact else "sim"),
                 })
             
             # Apply filters
@@ -3339,12 +3478,18 @@ class MainWindow(QMainWindow):
 
             # Pick absolute best
             def best_sort_key(x):
+                is_atlas = 1 if x.get('match_by') == "atlas" else 0
                 is_perfect = (x['similarity'] >= 1.0)
-                return (1 if is_perfect else 0, 1 if x['is_exact'] else 0, 1 if x['is_same_res'] else 0, x['similarity'])
+                return (is_atlas, 1 if is_perfect else 0, 1 if x['is_exact'] else 0, 1 if x['is_same_res'] else 0, x['similarity'])
             
             best_candidate = max(final_refined, key=best_sort_key)
             res['match_file'] = best_candidate['tex']['save_path']
             res['best_similarity'] = best_candidate['similarity']
+            res['match_pma'] = bool((best_candidate['tex'].get('atlas') or {}).get('pma'))
+            res['atlas_state'] = best_candidate['atlas_state']
+            res['atlas_text'] = best_candidate['atlas_text']
+            res['atlas_detail'] = best_candidate['atlas_detail']
+            res['match_by'] = best_candidate['match_by']
             
             final_refined.sort(key=lambda x: x['similarity'], reverse=True)
             
@@ -3360,7 +3505,12 @@ class MainWindow(QMainWindow):
                     "size": m_t.get('size', 0),
                     "similarity": round(r['similarity'], 4),
                     "is_exact": r['is_exact'],
-                    "is_same_res": r['is_same_res']
+                    "is_same_res": r['is_same_res'],
+                    "pma": bool((m_t.get('atlas') or {}).get('pma')),
+                    "atlas_state": r['atlas_state'],
+                    "atlas_text": r['atlas_text'],
+                    "atlas_detail": r['atlas_detail'],
+                    "match_by": r['match_by'],
                 })
             res['candidates'] = res_candidates
             self.log(f"  Similarity updated: {res['best_similarity']:.4f} with {len(res_candidates)} candidates.")
