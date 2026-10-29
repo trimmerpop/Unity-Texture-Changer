@@ -1285,6 +1285,8 @@ class MainWindow(QMainWindow):
         self.last_viewport = (0, 0, 1, 1)
         self.worker_thread = None
         self._is_deleting = False
+        self._pending_path_change = False
+        self._job_paths = None
         self.setAcceptDrops(True)
         self.init_ui()
         self.load_settings()
@@ -1294,6 +1296,9 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
+        if self._is_worker_running():
+            self.log("A task is running: the dropped folder is ignored, please retry afterwards.")
+            return
         urls = event.mimeData().urls()
         if urls:
             path = urls[0].toLocalFile()
@@ -1469,9 +1474,9 @@ class MainWindow(QMainWindow):
         self.orig_path = PathLineEdit(placeholder)
         self.orig_path.textChanged.connect(self.on_path_changed)
         orig_row.addWidget(self.orig_path)
-        btn_orig = QPushButton("Browse")
-        btn_orig.clicked.connect(lambda: self.browse_folder(self.orig_path))
-        orig_row.addWidget(btn_orig)
+        self.btn_orig_browse = QPushButton("Browse")
+        self.btn_orig_browse.clicked.connect(lambda: self.browse_folder(self.orig_path))
+        orig_row.addWidget(self.btn_orig_browse)
         self.chk_orig_scan_all = QCheckBox("Scan All Files")
         self.chk_orig_scan_all.setChecked(True)
         orig_row.addWidget(self.chk_orig_scan_all)
@@ -1482,9 +1487,9 @@ class MainWindow(QMainWindow):
         self.mod_path = PathLineEdit(placeholder)
         self.mod_path.textChanged.connect(self.on_path_changed)
         mod_row.addWidget(self.mod_path)
-        btn_mod = QPushButton("Browse")
-        btn_mod.clicked.connect(lambda: self.browse_folder(self.mod_path))
-        mod_row.addWidget(btn_mod)
+        self.btn_mod_browse = QPushButton("Browse")
+        self.btn_mod_browse.clicked.connect(lambda: self.browse_folder(self.mod_path))
+        mod_row.addWidget(self.btn_mod_browse)
         self.chk_mod_scan_all = QCheckBox("Scan All Files")
         self.chk_mod_scan_all.setChecked(True)
         mod_row.addWidget(self.chk_mod_scan_all)
@@ -1752,6 +1757,9 @@ class MainWindow(QMainWindow):
         
         self.worker_thread.start()
         self.start_time = time.time()
+        # Snapshot of the folders this job works on; if the UI paths differ when it
+        # finishes, the shown results belong to another folder (see on_finished).
+        self._job_paths = (self.orig_path.text().strip(), self.mod_path.text().strip())
         self.update_buttons()
 
     def on_worker_error(self, title, message):
@@ -1767,6 +1775,29 @@ class MainWindow(QMainWindow):
             self.on_copy_finished(data)
         elif isinstance(data, dict) and 'success' in data:
             self.on_apply_finished(data)
+
+        # The folders the job worked on vs. the folders selected now.
+        job_paths = getattr(self, '_job_paths', None)
+        current_paths = (self.orig_path.text().strip(), self.mod_path.text().strip())
+        if job_paths and job_paths != current_paths:
+            self.log("WARNING: the selected folders changed while the task was running. "
+                     "The results above belong to the previous folder; run Extract/Match again.")
+            self.results = []
+            self.tree.clear()
+            self.orig_textures = []
+            self.mod_textures = []
+            self.update_status_counts()
+
+        # Apply a deferred path change (path inputs are locked during a run, but a drop
+        # event or a programmatic change can still queue one).
+        if getattr(self, '_pending_path_change', False):
+            self._pending_path_change = False
+            self.log("Applying the deferred path change now.")
+            self.on_path_changed_direct(self.orig_path, self.orig_path.text())
+            if self.orig_path.text().strip():
+                self.check_and_clear_temp(self.temp_dir_orig)
+            if self.mod_path.text().strip():
+                self.check_and_clear_temp(self.temp_dir_mod)
             
         # Safely clear reference after all handlers are done
         self.worker_thread = None
@@ -1896,7 +1927,26 @@ class MainWindow(QMainWindow):
             self.tree.setSortingEnabled(True)
             self.log("Sorting by Similarity header is disabled.")
 
+    def _is_worker_running(self):
+        """True while a background task is still working (safe against deleted threads)."""
+        thread = getattr(self, 'worker_thread', None)
+        if thread is None:
+            return False
+        try:
+            return bool(thread.isRunning())
+        except (RuntimeError, AttributeError):
+            self.worker_thread = None
+            return False
+
     def on_path_changed(self, _):
+        # Changing the source folders while an asset is being read/written is dangerous:
+        # the worker enumerates/writes files of the folder it started with, and the temp
+        # cleanup below would delete files it is still writing. Defer until it finished.
+        if self._is_worker_running():
+            self._pending_path_change = True
+            self.log("A task is running: the path/option change is applied after it finishes.")
+            return
+
         # Auto-detect mode and clear temp if path changed
         sender = self.sender()
         # QObject.sender() is typed as QObject, so narrow it before calling text().
@@ -1947,6 +1997,10 @@ class MainWindow(QMainWindow):
                     
     def check_and_clear_temp(self, temp_path):
         """Clears the temp folder if it contains files from a previous extraction."""
+        if self._is_worker_running():
+            # The worker may still be writing extracted PNGs into this folder.
+            self.log("Temp cleanup deferred: a task is still running.")
+            return
         if os.path.exists(temp_path) and os.listdir(temp_path):
             # Only clear if metadata.json exists inside, meaning it was used for extraction
             metadata_path = os.path.join(temp_path, "metadata.json")
@@ -3241,6 +3295,11 @@ class MainWindow(QMainWindow):
         # 4. Apply / Copy
         has_results = bool(getattr(self, 'results', None))
         
+        # Path inputs are locked while a task runs: changing them mid-run used to reset the
+        # result list and clear the temp folder the worker is still reading/writing.
+        for widget in (self.orig_path, self.mod_path, self.btn_orig_browse, self.btn_mod_browse):
+            widget.setEnabled(not is_running)
+
         # Apply logic: Allow in Unity/APK modes (is_orig_game) OR direct Image mode
         # Requirement: Orig is game/folder, and (Mod is image OR Mod is extracted)
         mod_ready = (mode == "Image") or (not is_mod_game) or mod_extracted

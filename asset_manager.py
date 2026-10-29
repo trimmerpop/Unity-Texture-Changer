@@ -96,6 +96,19 @@ class AssetManager:
         # FORCE 2021.3.45 for this specific project as requested by user
         self.forced_engine_version = (2021, 3, 45, 2)
 
+    @staticmethod
+    def file_signature(path):
+        """Returns (size, mtime_ns) of a file, or None when it cannot be stat'ed.
+
+        Used to detect that a big asset changed on disk (another tool, a copied folder,
+        a re-downloaded build) between reading it and writing it back.
+        """
+        try:
+            stat = os.stat(path)
+            return (stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            return None
+
     def sanitize_filename(self, filename):
         """Sanitizes filename for Windows/Unix compatibility by removing specific characters."""
         return re.sub(r'[\\/:*?"<>|]', '_', filename)
@@ -291,7 +304,13 @@ class AssetManager:
             try:
                 file_size = os.path.getsize(path)
                 log(f"Processing {os.path.basename(path)} ({file_size} bytes)...")
+                signature_before = self.file_signature(path)
                 env = UnityPy.load(path)
+                if self.file_signature(path) != signature_before:
+                    # The folder/file was swapped (or the build was copied over) while the
+                    # asset was being read: whatever we parse now belongs to a moving target.
+                    log(f"  [SKIP] {os.path.basename(path)} changed on disk while it was read. Skipped.")
+                    continue
                 
                 # Engine version of the loaded file(s); unknown versions are forced onto the
                 # files instead of being assigned to `.version` directly (see
@@ -382,8 +401,13 @@ class AssetManager:
 
                             buf = io.BytesIO()
                             img.save(buf, format="PNG")
-                            with open(save_path, "wb") as f:
-                                f.write(buf.getvalue())
+                            try:
+                                with open(save_path, "wb") as f:
+                                    f.write(buf.getvalue())
+                            except OSError as error:
+                                # e.g. the temp folder was cleared while this asset was read
+                                log(f"  [SKIP] Could not write {safe_name}: {error}")
+                                continue
                                 
                             found_textures.append({
                                 "name": texture_name,
@@ -409,6 +433,10 @@ class AssetManager:
             else: print(msg)
         if not replacements: return False
         abs_source_path = os.path.abspath(source_asset_path)
+        signature_before = self.file_signature(abs_source_path)
+        if signature_before is None:
+            log(f"ERROR: {os.path.basename(abs_source_path)} not found.")
+            return False
         bak_path = abs_source_path + ".bak"
         if not os.path.exists(bak_path):
             try: shutil.copy2(abs_source_path, bak_path)
@@ -448,6 +476,12 @@ class AssetManager:
                 if save_file is None: return False
                 try: new_data = save_file(packer='original')
                 except: new_data = save_file(packer='none')
+                if self.file_signature(abs_source_path) != signature_before:
+                    # The asset was replaced on disk (folder swapped / re-extracted) after we
+                    # read it. Writing now would overwrite whatever the newer file contains.
+                    log(f"ERROR: {os.path.basename(abs_source_path)} changed on disk while it was processed. "
+                        f"Nothing was written to avoid overwriting newer data.")
+                    return False
                 with open(abs_source_path, "wb") as f: f.write(new_data)
                 new_md5 = hashlib.md5(new_data).hexdigest()
                 if abs_source_path.lower().endswith('.bundle'):
