@@ -1,3 +1,4 @@
+import os
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea
 from PyQt6.QtCore import Qt, QPoint, QRect, QSize, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QWheelEvent, QMouseEvent

@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QPlainTextEdit, QTreeWidget, QTreeWidgetItem, QComboBox, QSplitter, QFrame)
 from PyQt6.QtGui import QIcon, QAction, QDragEnterEvent, QDropEvent, QMouseEvent, QWheelEvent, QPixmap, QImage, QPainter, QPen, QFontMetrics
 from PIL import Image
-from asset_manager import AssetManager
+from asset_manager import AssetManager, SUPPORTED_IMAGE_EXTS, convert_image_format
 from similarity import get_image_hash, hamming_similarity, compare_images, load_image
 from comparison_widget import ComparisonWidget
 import cv2
@@ -21,7 +21,8 @@ from packaging import version
 import ctypes
 
 class SortableTreeWidgetItem(QTreeWidgetItem):
-    def natural_key(self, text):
+    @staticmethod
+    def natural_key(text):
         import re
         return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', text)]
 
@@ -54,7 +55,7 @@ class SortableTreeWidgetItem(QTreeWidgetItem):
             t1 = self.text(1)
             t2 = other.text(1)
             n1 = self.natural_key(t1)
-            n2 = other.natural_key(t2)
+            n2 = self.natural_key(t2)
             if n1 != n2: return n1 < n2
             if t1 != t2: return t1 < t2
             
@@ -109,7 +110,7 @@ class SortableTreeWidgetItem(QTreeWidgetItem):
             t1 = self.text(column)
             t2 = other.text(column)
             n1 = self.natural_key(t1)
-            n2 = other.natural_key(t2)
+            n2 = self.natural_key(t2)
             if n1 != n2: return n1 < n2
             if t1 != t2: return t1 < t2
             return tie_breaker()
@@ -307,6 +308,26 @@ class WorkerThread(QThread):
         elif self.task_type == "copy":
             self.run_copy()
 
+    def _write_replacement_image(self, src_path, dst_path):
+        """Writes src_path over dst_path, converting to the destination format when
+        'Save as original format' is enabled.
+
+        Returns True when dst_path was written. If the requested conversion fails the
+        destination is left untouched (instead of copying bytes of the wrong format).
+        """
+        if self.args.get('save_as_original', True):
+            dst_ext = os.path.splitext(dst_path)[1].lower()
+            src_ext = os.path.splitext(src_path)[1].lower()
+            if dst_ext != src_ext and dst_ext in SUPPORTED_IMAGE_EXTS:
+                if convert_image_format(src_path, dst_path):
+                    self.sig_log.emit(f"  Converted {os.path.basename(src_path)} -> {dst_ext} ({os.path.basename(dst_path)})")
+                    return True
+                self.sig_log.emit(f"  WARNING: Could not convert {os.path.basename(src_path)} to {dst_ext}. "
+                                  f"Skipped, {os.path.basename(dst_path)} left untouched.")
+                return False
+        shutil.copy2(src_path, dst_path)
+        return True
+
     def run_apply(self):
         to_replace = self.args['to_replace']
         orig_dir = self.args['orig_dir']
@@ -315,12 +336,18 @@ class WorkerThread(QThread):
         temp_mod = self.args['temp_mod']
         mode = self.args['mode']
         high_quality = self.args.get('high_quality', False)
+        save_as_original = self.args.get('save_as_original', True)
         
         am = AssetManager(orig_dir, mod_dir, temp_orig, temp_mod)
         total = len(to_replace)
         count = 0
         
         self.sig_log.emit(f"Active Apply Mode: {mode}")
+        self.sig_log.emit(f"Save as original format: {'ON' if save_as_original else 'OFF'}")
+        # EXCEPTION: with High Quality (BC7) the texture format is intentionally changed,
+        # so 'Save as original format' is not applied to Unity texture data.
+        if high_quality and save_as_original and mode in ("Unity", "Unity APK"):
+            self.sig_log.emit("High Quality (BC7) is enabled: Unity textures are saved as BC7, 'Save as original format' is skipped for them.")
         
         # 1. GROUPING: Separate Unity replacements from direct file replacements
         unity_groups = {} # source_file -> {'replacements': [], 'results': []}
@@ -380,7 +407,7 @@ class WorkerThread(QThread):
                         try:
                             # Copy the modified image to overwrite the original extracted image
                             if res.get('match_file'):
-                                shutil.copy2(res['match_file'], res['original']['save_path'])
+                                self._write_replacement_image(res['match_file'], res['original']['save_path'])
                         except Exception as e:
                             self.sig_log.emit(f"Sync failed for {res['original']['name']}: {e}")
                 processed_count += len(replacements)
@@ -399,8 +426,10 @@ class WorkerThread(QThread):
                 
                 self.sig_progress.emit(int((processed_count/total)*100), f"Copying files {i+1}/{total_direct}: {o['name']}")
                 try:
-                    shutil.copy2(res['match_file'], o['save_path'])
-                    count += 1
+                    if self._write_replacement_image(res['match_file'], o['save_path']):
+                        count += 1
+                    else:
+                        self.sig_log.emit(f"Skipped {o['name']}: format conversion failed.")
                 except Exception as e:
                     self.sig_log.emit(f"Failed to overwrite {o['save_path']}: {e}")
                 processed_count += 1
@@ -495,6 +524,7 @@ class WorkerThread(QThread):
     def run_copy(self):
         to_replace = self.args['to_replace']
         target_dir = self.args['target_dir']
+        save_as_original = self.args.get('save_as_original', True)
         
         count = 0
         total = len(to_replace)
@@ -503,21 +533,35 @@ class WorkerThread(QThread):
             src = res['match_file']
             if not src: continue
             
+            orig = res['original']
+            src_ext = os.path.splitext(src)[1]
+            # 'Save as original format': export using the original file's extension
+            orig_ext = os.path.splitext(orig.get('save_path', '') or '')[1]
+            if save_as_original and orig_ext.lower() in SUPPORTED_IMAGE_EXTS:
+                ext = orig_ext
+            else:
+                ext = src_ext
+            
             # Filename Logic
-            ext = os.path.splitext(src)[1]
             if self.args.get('use_uabea_format'):
-                orig = res['original']
                 assets_name = os.path.basename(orig.get('source_asset', 'Unknown'))
                 path_id = orig.get('path_id', '0')
                 dst_name = f"{orig['name']}-{assets_name}-{path_id}{ext}"
             else:
-                dst_name = res['original']['name'] + ext
+                dst_name = orig['name'] + ext
                 
             dst = os.path.join(target_dir, dst_name)
             self.sig_progress.emit(int((i/total)*100), f"Copying {i+1}/{total}: {dst_name}")
             
             try:
-                shutil.copy2(src, dst)
+                if ext.lower() != src_ext.lower():
+                    if convert_image_format(src, dst):
+                        self.sig_log.emit(f"Converted {os.path.basename(src)} -> {ext} ({dst_name})")
+                    else:
+                        self.sig_log.emit(f"WARNING: Could not convert {os.path.basename(src)} to {ext}. Skipping {dst_name}.")
+                        continue
+                else:
+                    shutil.copy2(src, dst)
                 count += 1
             except Exception as e:
                 self.sig_log.emit(f"Failed to copy {src}: {e}")
@@ -662,7 +706,7 @@ class WorkerThread(QThread):
                 textures = []
                 for root, _, fnames in os.walk(current_target_dir):
                     for f in fnames:
-                        if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        if f.lower().endswith(SUPPORTED_IMAGE_EXTS):
                             path = os.path.join(root, f)
                             textures.append({
                                 "name": os.path.splitext(f)[0],
@@ -971,7 +1015,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Unity Texture Changer")
         # Determine internal resource path (sys._MEIPASS when frozen)
         if getattr(sys, 'frozen', False):
-            self.res_dir = sys._MEIPASS
+            # sys._MEIPASS is injected by PyInstaller at runtime only
+            self.res_dir = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
             self.base_dir = os.path.dirname(sys.executable)
         else:
             self.res_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1045,20 +1090,6 @@ class MainWindow(QMainWindow):
             else:
                 self.mod_path.setText(resolved_path)
                 self.log(f"Overwrote Modified Path: {resolved_path}")
-
-    def closeEvent(self, event):
-        """Save metadata and settings on exit."""
-        try:
-            self._sync_metadata_to_disk()
-            # Save some UI settings if needed
-            settings = QSettings("config.ini", QSettings.Format.IniFormat)
-            settings.setValue("options/mode", self.mode_combo.currentText())
-            settings.setValue("options/high_quality", self.chk_high_quality.isChecked())
-            settings.sync()
-            self.log("Metadata and settings saved on exit.")
-        except Exception as e:
-            print(f"Error during close: {e}")
-        event.accept()
 
     def _normalize_textures(self, textures, temp_path):
         """Ensures all textures have required fields like 'save_path' and 'size'."""
@@ -1141,6 +1172,7 @@ class MainWindow(QMainWindow):
         settings.setValue("options/num_candidates", self.num_candidates.text())
         settings.setValue("options/highlight_diff", self.diff_check.isChecked())
         settings.setValue("options/high_quality", self.chk_high_quality.isChecked())
+        settings.setValue("options/save_as_original", self.chk_save_original.isChecked())
         settings.setValue("options/scan_all_orig", self.chk_orig_scan_all.isChecked())
         settings.setValue("options/scan_all_mod", self.chk_mod_scan_all.isChecked())
         settings.sync() # Force write to disk immediately
@@ -1181,6 +1213,8 @@ class MainWindow(QMainWindow):
             self.diff_check.setChecked(highlight_diff)
             
             self.chk_high_quality.setChecked(get_bool_val("options/high_quality", "false"))
+
+            self.chk_save_original.setChecked(get_bool_val("options/save_as_original", "true"))
             
             self.chk_orig_scan_all.setChecked(get_bool_val("options/scan_all_orig", "true"))
             self.chk_mod_scan_all.setChecked(get_bool_val("options/scan_all_mod", "true"))
@@ -1331,6 +1365,12 @@ class MainWindow(QMainWindow):
         self.chk_uabea_format.setToolTip("Export as Name-Assets-PathID.png to prevent overwriting duplicates")
         self.chk_uabea_format.setChecked(False)
         opt_row2.addWidget(self.chk_uabea_format)
+
+        self.chk_save_original = QCheckBox("Save as original format")
+        self.chk_save_original.setToolTip("Convert the replacement image to the original file's format before writing "
+                                          "(e.g. .webp -> .png). Skipped when Unity textures are saved as BC7.")
+        self.chk_save_original.setChecked(True)
+        opt_row2.addWidget(self.chk_save_original)
         
         opt_row2.addStretch()
         header_controls_vbox.addLayout(opt_row2)
@@ -1482,9 +1522,6 @@ class MainWindow(QMainWindow):
         self.start_time = time.time()
         self.update_buttons()
 
-    def get_asset_manager(self):
-        return AssetManager(self.orig_path.text(), self.mod_path.text(), self.temp_dir_orig, self.temp_dir_mod)
-
     def on_worker_error(self, title, message):
         QMessageBox.warning(self, title, message)
 
@@ -1532,7 +1569,7 @@ class MainWindow(QMainWindow):
         path = os.path.normpath(path)
         try:
             for root, dirs, fnames in os.walk(path):
-                if any(f.lower().endswith(('.png', '.jpg', '.jpeg')) for f in fnames):
+                if any(f.lower().endswith(SUPPORTED_IMAGE_EXTS) for f in fnames):
                     return True
                 # No limit on depth, search everything
         except: pass
@@ -1630,8 +1667,8 @@ class MainWindow(QMainWindow):
     def on_path_changed(self, _):
         # Auto-detect mode and clear temp if path changed
         sender = self.sender()
-        path_raw = sender.text() if sender else ""
-        path = path_raw.strip()
+        # QObject.sender() is typed as QObject, so narrow it before calling text().
+        path = sender.text().strip() if isinstance(sender, QLineEdit) else ""
         
         # 1. Validity Check
         # If the path is empty, we clear results.
@@ -1991,7 +2028,7 @@ class MainWindow(QMainWindow):
         self.log(f"Scanning images in {folder} (including all subfolders)...")
         for root, dirs, fnames in os.walk(folder):
             for f in fnames:
-                if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+                if f.lower().endswith(SUPPORTED_IMAGE_EXTS):
                     path = os.path.join(root, f)
                     try:
                         img = Image.open(path)
@@ -2954,6 +2991,8 @@ class MainWindow(QMainWindow):
         self.chk_uabea_format.setVisible(is_unity_mode)
         self.chk_uabea_format.setEnabled(not is_running)
 
+        self.chk_save_original.setEnabled(not is_running)
+
         # UI Guarding: Disable tree and thumbnail interaction during tasks
         self.tree.setEnabled(not is_running)
         self.thumbnail_preview.setEnabled(not is_running)
@@ -3008,7 +3047,8 @@ class MainWindow(QMainWindow):
         if not target_dir: return
 
         self.start_worker("copy", to_replace=to_replace, target_dir=target_dir,
-                          use_uabea_format=self.chk_uabea_format.isChecked())
+                          use_uabea_format=self.chk_uabea_format.isChecked(),
+                          save_as_original=self.chk_save_original.isChecked())
         self.update_buttons()
 
     def on_copy_finished(self, summary):
@@ -3224,7 +3264,8 @@ class MainWindow(QMainWindow):
                           temp_orig=self.temp_dir_orig, temp_mod=self.temp_dir_mod,
                           mode=self.mode_combo.currentText(),
                           apk_info=getattr(self, 'apk_info', {}),
-                          high_quality=self.chk_high_quality.isChecked())
+                          high_quality=self.chk_high_quality.isChecked(),
+                          save_as_original=self.chk_save_original.isChecked())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

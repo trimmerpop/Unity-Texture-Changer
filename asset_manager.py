@@ -9,7 +9,82 @@ import zlib
 import hashlib
 import traceback
 import struct
-from UnityPy.export.Texture2DConverter import get_image_from_texture2d
+from UnityPy.export.Texture2DConverter import get_image_from_texture2d, parse_image_data
+from UnityPy.files import BundleFile, SerializedFile
+from UnityPy.helpers.UnityVersion import UnityVersion
+
+# Picture extensions handled by the whole app. Every file listed here is decoded by
+# similarity.load_image() (OpenCV -> Pillow fallback) and by PIL.Image.open(), i.e. only
+# decoders that already ship with opencv-python / Pillow, so no extra dependency is needed.
+#
+# Deliberately NOT listed:
+#   .hdr / .pfm  -> float pixels (0..1): similarity.ensure_grayscale() alpha masking
+#                   (`gray[alpha < 10] = 0`) wipes every pixel, so all matches become 1.0
+#   .exr         -> needs OpenEXR (missing in the OpenCV wheel) / no Pillow plugin
+#   .psd         -> multi layer / CMYK sources, rarely correct as a texture
+#   .pcx .sgi .im .msp .xbm .xpm .pcd .ras .icns .fits -> legacy/oddball encoders
+#   .pdf .eps .ps .h5  -> need Ghostscript/h5py or are documents, not textures
+SUPPORTED_IMAGE_EXTS = (
+    '.png', '.apng', '.jpg', '.jpeg', '.jpe', '.jfif',
+    '.bmp', '.dib', '.gif', '.tif', '.tiff', '.webp',
+    '.tga', '.dds', '.jp2', '.j2k', '.j2c', '.jpc',
+    '.ppm', '.pgm', '.pbm', '.pnm', '.avif', '.qoi',
+)
+
+# Extension -> Pillow save format. Must stay in sync with SUPPORTED_IMAGE_EXTS.
+IMAGE_SAVE_FORMATS = {
+    '.png': 'PNG', '.apng': 'PNG',
+    '.jpg': 'JPEG', '.jpeg': 'JPEG', '.jpe': 'JPEG', '.jfif': 'JPEG',
+    '.bmp': 'BMP', '.dib': 'BMP', '.gif': 'GIF',
+    '.tif': 'TIFF', '.tiff': 'TIFF', '.webp': 'WEBP',
+    '.tga': 'TGA', '.dds': 'DDS',
+    '.jp2': 'JPEG2000', '.j2k': 'JPEG2000', '.j2c': 'JPEG2000', '.jpc': 'JPEG2000',
+    '.ppm': 'PPM', '.pgm': 'PPM', '.pbm': 'PPM', '.pnm': 'PPM',
+    '.avif': 'AVIF', '.qoi': 'QOI',
+}
+
+# Formats that cannot reliably store an alpha channel, so RGBA sources are flattened to RGB.
+NO_ALPHA_IMAGE_EXTS = (
+    '.jpg', '.jpeg', '.jpe', '.jfif', '.bmp', '.dib',
+    '.ppm', '.pgm', '.pbm', '.pnm', '.dds',
+)
+
+
+def convert_image_format(src_path, dst_path):
+    """Re-encodes src_path into the file format implied by the extension of dst_path.
+
+    Returns True on success. dst_path is only touched when the conversion succeeded
+    (the image is written to a temporary file first), so a failure never leaves a
+    corrupt texture behind.
+    """
+    ext = os.path.splitext(dst_path)[1].lower()
+    save_format = IMAGE_SAVE_FORMATS.get(ext)
+    if not save_format:
+        return False
+
+    tmp_path = dst_path + ".tmp"
+    try:
+        with Image.open(src_path) as img:
+            img.load()
+            if ext in NO_ALPHA_IMAGE_EXTS:
+                out_img = img.convert("RGB")
+            elif img.mode in ("RGB", "RGBA"):
+                out_img = img.copy()
+            elif "A" in img.getbands() or img.mode in ("P", "PA", "LA"):
+                out_img = img.convert("RGBA")
+            else:
+                out_img = img.convert("RGB")
+            out_img.save(tmp_path, format=save_format)
+        os.replace(tmp_path, dst_path)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
 
 class AssetManager:
     def __init__(self, orig_dir, mod_dir, output_dir_orig, output_dir_mod):
@@ -58,6 +133,126 @@ class AssetManager:
             return bytes(corrected)
         return raw_data
 
+    def decode_texture_with_fixed_pixels(self, texture_2d, fixed_pixels):
+        """Decodes already stride-corrected pixel bytes with UnityPy's own decoder.
+
+        get_image_from_texture2d(texture_2d, flip=True) always pulls the pixels from
+        texture_2d.get_image_data(), and its second parameter is the `flip` flag, so
+        corrected bytes cannot be handed over as an argument. They are swapped into
+        image_data only for the duration of the decode and the original value (bytes or
+        None for streamed textures) is restored afterwards.
+        """
+        original_pixels = getattr(texture_2d, "image_data", None)
+        try:
+            texture_2d.image_data = fixed_pixels
+            return get_image_from_texture2d(texture_2d)
+        finally:
+            texture_2d.image_data = original_pixels
+
+    @staticmethod
+    def iter_env_files(env):
+        """Yields every file of a loaded environment, descending into bundles / web files.
+
+        SerializedFile.files returns its *objects* instead of files, so the descent stops
+        at a SerializedFile; the nested ones are reached through the BundleFile / WebFile
+        that own them.
+        """
+        pending = [getattr(env, "file", None)]
+        pending.extend(getattr(env, "files", {}).values())
+        seen = set()
+        while pending:
+            node = pending.pop()
+            if node is None or id(node) in seen: continue
+            seen.add(id(node))
+            yield node
+            if isinstance(node, SerializedFile): continue  # .files are objects, not files
+            children = getattr(node, "files", None)
+            if isinstance(children, dict): pending.extend(children.values())
+
+    @staticmethod
+    def engine_version_tuple(value):
+        """Normalises a Unity engine version into (major, minor, build, patch) or None.
+
+        UnityPy reports SerializedFile.version as a UnityVersion and BundleFile.version as
+        the bundle *header* format number, so only UnityVersion objects, tuples/lists and
+        version strings ("2021.3.45f2") actually carry an engine version. Everything else
+        (ints, empty strings, None) is treated as unknown.
+
+        Note: UnityVersion.__eq__ raises NotImplementedError for str/int operands, so raw
+        version values must never be compared against strings or plain ints directly.
+        """
+        if isinstance(value, UnityVersion):
+            return (value.major, value.minor, value.build, value.type_number)
+        if isinstance(value, str):
+            match = re.match(r"\s*(\d+)\.(\d+)\.(\d+)(?:f(\d+))?", value)
+            if not match: return None
+            major, minor, build, patch = match.groups()
+            return (int(major), int(minor), int(build), int(patch) if patch else 0)
+        if isinstance(value, (tuple, list)) and len(value) >= 3:
+            try: parts = [int(part) for part in value[:4]]
+            except (TypeError, ValueError): return None
+            return tuple(parts + [0] * (4 - len(parts)))
+        return None
+
+    @staticmethod
+    def is_usable_engine_version(version):
+        """False for the placeholders UnityPy reports when a file carries no version string."""
+        if not isinstance(version, tuple) or len(version) < 3: return False
+        return version[0] >= 3  # rejects 0.0.0 and the 2.5.0f5 placeholder
+
+    @staticmethod
+    def version_string(version):
+        """Formats a (major, minor, build, patch) tuple as a Unity version string."""
+        major, minor, build, patch = (list(version) + [0, 0, 0, 0])[:4]
+        return f"{major}.{minor}.{build}f{patch}"
+
+    def apply_engine_version(self, env, version):
+        """Writes version into every SerializedFile of env (bundle children included).
+
+        The engine version has to go through SerializedFile.set_version() and the bundle's
+        version_engine string, because SerializedFile.version is a UnityVersion (int
+        subclass) and BundleFile.version is the bundle *header* format number: assigning a
+        version tuple to `.version` either raises or corrupts the header written by save().
+        Returns the number of files that were updated.
+        """
+        version_str = self.version_string(version)
+        updated = 0
+        for asset_file in self.iter_env_files(env):
+            try:
+                if isinstance(asset_file, SerializedFile):
+                    asset_file.set_version(version_str)
+                    updated += 1
+                elif isinstance(asset_file, BundleFile):
+                    asset_file.version_engine = version_str
+                    updated += 1
+            except Exception:
+                continue
+        return updated
+
+    def resolve_engine_version(self, env, log_callback=None):
+        """Returns the engine version of env as a (major, minor, build, patch) tuple.
+
+        Files without a readable engine version (stripped typetree, empty version_engine
+        string) get forced_engine_version / last_known_version written into them, so the
+        typetree parser and the texture decoders agree on the version of this project.
+        """
+        files = list(self.iter_env_files(env))
+        candidates = [getattr(f, "version", None) for f in files if isinstance(f, SerializedFile)]
+        candidates += [getattr(f, "version_engine", None) for f in files if isinstance(f, BundleFile)]
+        for candidate in candidates:
+            version = self.engine_version_tuple(candidate)
+            if self.is_usable_engine_version(version):
+                self.last_known_version = version
+                return version
+
+        fallback = self.engine_version_tuple(
+            self.forced_engine_version or self.last_known_version or (2021, 3, 45, 2)
+        ) or (2021, 3, 45, 2)
+        updated = self.apply_engine_version(env, fallback)
+        if log_callback and updated:
+            log_callback(f"  [VERSION] Engine version unknown, forced {self.version_string(fallback)} on {updated} file(s).")
+        return fallback
+
     def extract_textures(self, game_dir, output_dir, progress_callback=None, log_callback=None, scan_all=False):
         found_textures = []
         if not os.path.exists(output_dir): os.makedirs(output_dir)
@@ -71,7 +266,7 @@ class AssetManager:
             return found_textures
             
         all_files = []
-        skip_exts = ('.png', '.jpg', '.jpeg', '.json', '.txt', '.py', '.ini', '.bak', '.apk', '.exe', '.dll', '.wav', '.mp3', '.ogg', '.mp4')
+        skip_exts = SUPPORTED_IMAGE_EXTS + ('.json', '.txt', '.py', '.ini', '.bak', '.apk', '.exe', '.dll', '.wav', '.mp3', '.ogg', '.mp4')
         for root, dirs, files in os.walk(game_dir):
             for file in files:
                 filepath = os.path.join(root, file)
@@ -98,21 +293,10 @@ class AssetManager:
                 log(f"Processing {os.path.basename(path)} ({file_size} bytes)...")
                 env = UnityPy.load(path)
                 
-                engine_version = "Unknown"
-                try:
-                    raw_ver = getattr(env.file, "version", "Unknown") if hasattr(env, "file") else "Unknown"
-                    is_bad = (raw_ver == "Unknown" or not raw_ver or raw_ver == (0,0,0,0) or 
-                              (isinstance(raw_ver, str) and (len(raw_ver) < 3 or raw_ver.isdigit())) or 
-                              (isinstance(raw_ver, int) and raw_ver < 100))
-                    if is_bad:
-                        engine_version = self.forced_engine_version or self.last_known_version or (2021, 3, 45, 2)
-                        if hasattr(env, "file"):
-                            try: env.file.version = engine_version
-                            except: pass
-                    else:
-                        engine_version = raw_ver
-                    if not is_bad: self.last_known_version = engine_version
-                except: pass
+                # Engine version of the loaded file(s); unknown versions are forced onto the
+                # files instead of being assigned to `.version` directly (see
+                # resolve_engine_version() for why the types differ per file kind).
+                engine_version = self.resolve_engine_version(env, log)
 
                 obj_count = 0
                 type_counts = {}
@@ -130,7 +314,7 @@ class AssetManager:
                             img = None
                             is_tree = False
                             
-                            is_2021_3_45 = (engine_version == (2021, 3, 45, 2) or "2021.3.45" in str(engine_version))
+                            is_2021_3_45 = engine_version[:3] == (2021, 3, 45)
                             
                             h_w, h_h, h_fmt = 0, 0, 0
                             h_name = f"Unnamed_{obj.path_id}"
@@ -151,7 +335,9 @@ class AssetManager:
                                                 raw_pixels = data.get_image_data()
                                                 if raw_pixels and len(raw_pixels) > (h_w * h_h * bpp):
                                                     fixed_pixels = self.apply_stride_correction(raw_pixels, h_w, h_h, bpp, log)
-                                                    img = get_image_from_texture2d(data, fixed_pixels)
+                                                    # Only trust a correction that yields exactly one mip level.
+                                                    if len(fixed_pixels) == h_w * h_h * bpp:
+                                                        img = self.decode_texture_with_fixed_pixels(data, fixed_pixels)
                                         except: img = None
                             except: pass
 
@@ -257,8 +443,11 @@ class AssetManager:
             if modified_count > 0:
                 old_crc32 = self.calculate_crc32(abs_source_path)
                 old_size = os.path.getsize(abs_source_path)
-                try: new_data = env.file.save(packer='original')
-                except: new_data = env.file.save(packer=0)
+                # env.file is a SerializedFile or a BundleFile; both expose save(packer=...)
+                save_file = getattr(env.file, "save", None)
+                if save_file is None: return False
+                try: new_data = save_file(packer='original')
+                except: new_data = save_file(packer='none')
                 with open(abs_source_path, "wb") as f: f.write(new_data)
                 new_md5 = hashlib.md5(new_data).hexdigest()
                 if abs_source_path.lower().endswith('.bundle'):
@@ -451,19 +640,18 @@ class AssetManager:
                 bpp = 4 if discovered_fmt in [4, 5] else (3 if discovered_fmt == 3 else (2 if discovered_fmt in [2, 13] else 1))
                 image_data = self.apply_stride_correction(image_data, discovered_w, discovered_h, bpp, dlog)
             
-            class MockTexture2D:
-                def __init__(self, name, w, h, fmt, data, obj):
-                    self.m_Name, self.m_Width, self.m_Height, self.m_TextureFormat = name, w, h, fmt
-                    self.image_data, self.assets_file, self.version = data, obj.assets_file, obj.assets_file.version
-                    self.m_StreamData, self.m_MipCount, self.m_TextureDimension = None, 1, 2
-                    self.m_CompleteImageSize, self.m_ColorSpace, self.m_IsReadable = len(data), 1, True
-                    self.m_LightmapFormat, self.object_reader = 0, obj
-                def get_image_data(self): return self.image_data
-
             try:
-                from UnityPy.enums import TextureFormat
-                img = get_image_from_texture2d(MockTexture2D(name, discovered_w, discovered_h, TextureFormat(discovered_fmt), image_data, obj))
-                return img
+                from UnityPy.enums import BuildTarget, TextureFormat
+                # parse_image_data() is what get_image_from_texture2d() delegates to, so it
+                # decodes raw bytes without needing a Texture2D instance to wrap them in.
+                return parse_image_data(
+                    image_data,
+                    discovered_w,
+                    discovered_h,
+                    TextureFormat(discovered_fmt),
+                    getattr(obj, "version", (0, 0, 0, 0)),
+                    getattr(obj, "platform", BuildTarget.UnknownPlatform),
+                )
             except: return None
         except: return None
 
