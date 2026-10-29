@@ -15,6 +15,7 @@ from PIL import Image
 from asset_manager import AssetManager, SUPPORTED_IMAGE_EXTS, convert_image_format
 from similarity import get_image_hash, hamming_similarity, compare_images, load_image
 from comparison_widget import ComparisonWidget
+import atlas as atlas_mod
 import cv2
 import time
 from packaging import version
@@ -229,6 +230,26 @@ def get_base_name(name):
     # Match underscore followed by one or more digits at the end of the string
     return re.sub(r'_\d+$', '', name)
 
+
+def atlas_keys(texture):
+    """Returns (strong, weak) identity keys for an atlas region item.
+
+    strong = "<atlas file>|<region>": identical between builds of the same game, so it
+             pairs the same sprite even when the atlas was repacked at another position
+             or rotation.
+    weak   = "<region>": fallback when the .atlas files were renamed between builds.
+    Both are empty for plain images and Unity textures.
+    """
+    meta = texture.get('atlas') or {}
+    name = meta.get('region')
+    if not name:
+        return "", ""
+    region = atlas_mod.region_key(name)
+    atlas_name = os.path.basename(meta.get('atlas_file') or "")
+    page_name = os.path.basename(meta.get('page_file') or "")
+    strong = f"{atlas_name or page_name}|{region}"
+    return strong, region
+
 class EnhancedTreeWidget(QTreeWidget):
     """QTreeWidget subclass that supports shortcuts like Space, Delete, and keypad +/-."""
     sig_delete_items = pyqtSignal()
@@ -349,16 +370,31 @@ class WorkerThread(QThread):
         if high_quality and save_as_original and mode in ("Unity", "Unity APK"):
             self.sig_log.emit("High Quality (BC7) is enabled: Unity textures are saved as BC7, 'Save as original format' is skipped for them.")
         
-        # 1. GROUPING: Separate Unity replacements from direct file replacements
+        # 1. GROUPING: Separate Unity, atlas-page and direct file replacements
         unity_groups = {} # source_file -> {'replacements': [], 'results': []}
-        direct_files = [] # list of (o_path, new_image_path, o_name)
+        atlas_groups = {} # original atlas page image -> [results]
+        direct_files = [] # list of results handled by plain file copy
         
         for res in to_replace:
             o = res['original']
             m_path = res['match_file']
             if not m_path: continue
             
-            if 'source_asset' in o and 'path_id' in o:
+            atlas_meta = o.get('atlas') or {}
+            if atlas_meta.get('region'):
+                page_path = atlas_meta.get('page_file') or ''
+                if not page_path or not os.path.exists(page_path):
+                    # Metadata may have been produced on another machine: look for the
+                    # page next to the recorded atlas file / inside the original folder.
+                    candidates = []
+                    if atlas_meta.get('atlas_file'):
+                        candidates.append(os.path.join(os.path.dirname(atlas_meta['atlas_file']),
+                                                       os.path.basename(page_path)))
+                    if page_path:
+                        candidates.append(os.path.join(orig_dir, os.path.basename(page_path)))
+                    page_path = next((c for c in candidates if c and os.path.exists(c)), page_path)
+                atlas_groups.setdefault(page_path, []).append(res)
+            elif 'source_asset' in o and 'path_id' in o:
                 src = o['source_asset']
                 if src not in unity_groups: unity_groups[src] = {'replacements': [], 'results': []}
                 unity_groups[src]['replacements'].append((o['path_id'], m_path))
@@ -367,11 +403,53 @@ class WorkerThread(QThread):
                 direct_files.append(res)
 
         total_unity = sum(len(data['replacements']) for data in unity_groups.values())
+        total_atlas = sum(len(v) for v in atlas_groups.values())
         total_direct = len(direct_files)
         
         processed_count = 0
         
-        # 2. PHASE 1: Process Unity Asset Replacements
+        # 2. PHASE 0: Atlas regions -> composite into the ORIGINAL page layout
+        if atlas_groups:
+            self.sig_log.emit(f"Writing {total_atlas} atlas regions into the original pages...")
+            for page_path, results in atlas_groups.items():
+                if not page_path or not os.path.exists(page_path):
+                    self.sig_log.emit(f"ERROR: Atlas page not found: {page_path}. Skipping {len(results)} region(s).")
+                    processed_count += len(results)
+                    continue
+                updates = []
+                for res in results:
+                    meta = res['original'].get('atlas') or {}
+                    region = atlas_mod.region_from_metadata(meta)
+                    if region is None:
+                        self.sig_log.emit(f"WARNING: No atlas info for {res['original'].get('name')}, skipped.")
+                        continue
+                    try:
+                        with Image.open(res['match_file']) as piece:
+                            piece.load()
+                            updates.append((region, piece.convert("RGBA"), bool(res.get('match_pma', False))))
+                    except Exception as error:
+                        self.sig_log.emit(f"WARNING: Could not read {os.path.basename(res['match_file'])}: {error}")
+                if not updates:
+                    processed_count += len(results)
+                    continue
+                self.sig_progress.emit(int((processed_count/total)*100),
+                                       f"Writing atlas page {os.path.basename(page_path)}...")
+                ok = atlas_mod.write_page_regions(page_path, updates)
+                if ok:
+                    count += len(updates)
+                    self.sig_log.emit(f"Atlas page updated: {os.path.basename(page_path)} "
+                                      f"({len(updates)} region(s), original layout kept)")
+                    for res in results:
+                        if res.get('match_file') and res['original'].get('save_path'):
+                            try:
+                                self._write_replacement_image(res['match_file'], res['original']['save_path'])
+                            except Exception as error:
+                                self.sig_log.emit(f"Sync failed for {res['original'].get('name')}: {error}")
+                else:
+                    self.sig_log.emit(f"ERROR: Could not write atlas page {os.path.basename(page_path)}")
+                processed_count += len(results)
+        
+        # 3. PHASE 1: Process Unity Asset Replacements
         if unity_groups:
             self.sig_log.emit(f"Processing Unity assets for {total_unity} replacements...")
             for src_file, group_data in unity_groups.items():
@@ -412,7 +490,7 @@ class WorkerThread(QThread):
                             self.sig_log.emit(f"Sync failed for {res['original']['name']}: {e}")
                 processed_count += len(replacements)
         
-        # 3. PHASE 2: Process Direct File Replacements (Non-Unity)
+        # 4. PHASE 2: Process Direct File Replacements (Non-Unity)
         if direct_files:
             self.sig_log.emit(f"Processing direct file copies for {total_direct} items...")
             for i, res in enumerate(direct_files):
@@ -434,7 +512,7 @@ class WorkerThread(QThread):
                     self.sig_log.emit(f"Failed to overwrite {o['save_path']}: {e}")
                 processed_count += 1
 
-        # 4. PHASE 3: APK Repacking (If Unity APK mode)
+        # 5. PHASE 3: APK Repacking (If Unity APK mode)
         if mode == "Unity APK" and 'apk_info' in self.args:
             apk_info = self.args['apk_info'] # {original_apk_path: temp_dir}
             self.sig_log.emit("Starting APK repacking process...")
@@ -569,6 +647,57 @@ class WorkerThread(QThread):
         self.sig_progress.emit(100, "Copy complete.")
         self.sig_finished.emit({"success": count, "total": total, "target_dir": target_dir, "successful_paths": [r['original']['save_path'] for r in to_replace]})
 
+    @staticmethod
+    def _has_unity_asset_files(folder):
+        """Cheap name-only check for Unity asset files (no UnityPy involved)."""
+        unity_exts = ('.assets', '.sharedassets', '.unity3d', '.bundle', '.resource', '.ress', '.apk')
+        for root, _dirs, files in os.walk(folder):
+            for name in files:
+                if name.lower().endswith(unity_exts):
+                    return True
+        return False
+
+    def _extract_folder_images(self, folder, temp_path, label):
+        """Atlas aware fallback extraction for plain folders (no Unity assets found).
+
+        Folders that contain .atlas files are split into their individual regions: the
+        page sheet itself is not offered as an item, because matching and replacing a
+        4000px sheet is useless. Page images referenced by an atlas are therefore
+        excluded from the plain image scan.
+        """
+        textures = []
+        page_images = set()
+
+        if self.args.get('atlas_regions', True):
+            for atlas_path in atlas_mod.find_atlas_files(folder):
+                atlas = atlas_mod.parse_atlas(atlas_path)
+                if not atlas.pages:
+                    continue
+                out_dir = os.path.join(temp_path, "atlas", os.path.splitext(os.path.basename(atlas_path))[0])
+                entries = atlas_mod.extract_atlas_regions(atlas_path, out_dir, log_callback=self.sig_log.emit)
+                for page in atlas.pages:
+                    page_path = os.path.abspath(atlas.page_path(page))
+                    page_images.add(os.path.normcase(page_path))
+                textures.extend(entries)
+                self.sig_log.emit(f"Atlas {os.path.basename(atlas_path)}: {len(entries)} regions -> {label}")
+            if textures:
+                self.sig_log.emit(f"Atlas regions in {label}: {len(textures)}")
+
+        for root, _, fnames in os.walk(folder):
+            for f in fnames:
+                if not f.lower().endswith(SUPPORTED_IMAGE_EXTS):
+                    continue
+                path = os.path.join(root, f)
+                if os.path.normcase(os.path.abspath(path)) in page_images:
+                    continue  # atlas page sheet, handled per region above
+                textures.append({
+                    "name": os.path.splitext(f)[0],
+                    "save_path": path,
+                    "size": os.path.getsize(path),
+                })
+        self.sig_log.emit(f"Found {len(textures)} images in {label} folder.")
+        return textures
+
     def run_extract(self):
         orig_dir = self.args['orig_dir']
         mod_dir = self.args['mod_dir']
@@ -665,7 +794,10 @@ class WorkerThread(QThread):
                         for t in textures:
                             if isinstance(t, dict):
                                 if 'file' in t:
-                                    t['save_path'] = os.path.join(temp_path, t['file'])
+                                    # atlas regions live in a sub folder, keep an existing path
+                                    candidate = os.path.join(temp_path, t['file'])
+                                    if os.path.exists(candidate):
+                                        t['save_path'] = candidate
                                 if 'size' not in t:
                                     if t.get('save_path') and os.path.exists(t['save_path']):
                                         t['size'] = os.path.getsize(t['save_path'])
@@ -690,10 +822,18 @@ class WorkerThread(QThread):
                 self.sig_progress.emit(prog, f"Extracting {label}: {text}")
 
             try:
-                textures = am.extract_textures(current_target_dir, temp_path, 
-                                            progress_callback=progress_cb, 
-                                            log_callback=self.sig_log.emit,
-                                            scan_all=scan_all)
+                atlas_files = atlas_mod.find_atlas_files(current_target_dir) if self.args.get('atlas_regions', True) else []
+                if atlas_files and not self._has_unity_asset_files(current_target_dir):
+                    # A web/atlas game can hold thousands of files that UnityPy would
+                    # reject one by one; skip that scan when there is nothing to find.
+                    self.sig_log.emit(f"Atlas folder detected ({len(atlas_files)} .atlas, no Unity assets). "
+                                      f"Skipping Unity asset scan.")
+                    textures = []
+                else:
+                    textures = am.extract_textures(current_target_dir, temp_path, 
+                                                progress_callback=progress_cb, 
+                                                log_callback=self.sig_log.emit,
+                                                scan_all=scan_all)
             except Exception as e:
                 self.sig_log.emit(f"ERROR: Extraction failed for {label}: {e}")
                 import traceback
@@ -701,19 +841,8 @@ class WorkerThread(QThread):
                 return []
             
             if not textures:
-                self.sig_log.emit(f"No Unity assets found in {label}. Checking for images...")
-                # Fallback: Scan images directly if no assets found
-                textures = []
-                for root, _, fnames in os.walk(current_target_dir):
-                    for f in fnames:
-                        if f.lower().endswith(SUPPORTED_IMAGE_EXTS):
-                            path = os.path.join(root, f)
-                            textures.append({
-                                "name": os.path.splitext(f)[0],
-                                "save_path": path,
-                                "size": os.path.getsize(path)
-                            })
-                self.sig_log.emit(f"Found {len(textures)} images in {label} folder.")
+                self.sig_log.emit(f"No Unity assets found in {label}. Checking for atlas / images...")
+                textures = self._extract_folder_images(current_target_dir, temp_path, label)
             
             # Ensure save_path and size are present
             for t in textures:
@@ -797,10 +926,15 @@ class WorkerThread(QThread):
             # 1. Name match candidates (including base name to ignore _PathID)
             o_name_lower = o_tex['name'].lower()
             o_base_lower = get_base_name(o_tex['name']).lower()
+            o_atlas_strong, o_atlas_weak = atlas_keys(o_tex)
             
             for m_tex in mod_textures:
-                # Name matching should bypass resolution filter
-                if m_tex['name'].lower() == o_name_lower or get_base_name(m_tex['name']).lower() == o_base_lower:
+                m_atlas_strong, m_atlas_weak = atlas_keys(m_tex)
+                is_atlas_pair = bool(o_atlas_strong) and (
+                    m_atlas_strong == o_atlas_strong or (bool(o_atlas_weak) and m_atlas_weak == o_atlas_weak)
+                )
+                # Atlas region identity and name matching should bypass resolution filter
+                if is_atlas_pair or m_tex['name'].lower() == o_name_lower or get_base_name(m_tex['name']).lower() == o_base_lower:
                     candidate_pool[m_tex['save_path']] = m_tex
                 elif same_res and (o_tex.get('width') != m_tex.get('width') or o_tex.get('height') != m_tex.get('height')):
                     continue
@@ -821,7 +955,11 @@ class WorkerThread(QThread):
             all_potentials = []
             for m_tex in candidate_pool.values():
                 refined_sim = compare_images(o_tex['save_path'], m_tex['save_path'])
-                is_exact = (m_tex['name'].lower() == o_tex['name'].lower())
+                m_atlas_strong, m_atlas_weak = atlas_keys(m_tex)
+                is_atlas_pair = bool(o_atlas_strong) and (
+                    m_atlas_strong == o_atlas_strong or (bool(o_atlas_weak) and m_atlas_weak == o_atlas_weak)
+                )
+                is_exact = is_atlas_pair or (m_tex['name'].lower() == o_tex['name'].lower())
 
                 is_same_res = (m_tex.get('width') == o_tex.get('width') and m_tex.get('height') == o_tex.get('height'))
                 all_potentials.append({
@@ -873,7 +1011,8 @@ class WorkerThread(QThread):
                     "size": m_t.get('size', 0),
                     "similarity": round(r['similarity'], 4),
                     "is_exact": r['is_exact'],
-                    "is_same_res": r['is_same_res']
+                    "is_same_res": r['is_same_res'],
+                    "pma": bool((m_t.get('atlas') or {}).get('pma')),
                 })
             if not IsAddedBestCandidate:
                 if len(candidates) >= num_candidates:
@@ -887,7 +1026,8 @@ class WorkerThread(QThread):
                     "size": m_t.get('size', 0),
                     "similarity": round(best_candidate['similarity'], 4),
                     "is_exact": best_candidate['is_exact'],
-                    "is_same_res": best_candidate['is_same_res']
+                    "is_same_res": best_candidate['is_same_res'],
+                    "pma": bool((m_t.get('atlas') or {}).get('pma')),
                 })
 
             # Unchecked Same/Cut-off logic
@@ -902,6 +1042,9 @@ class WorkerThread(QThread):
             results.append({
                 "original": o_tex,
                 "match_file": best_match_path,
+                # True when the replacement already uses the original page's alpha
+                # convention (atlas region taken from a premultiplied page)
+                "match_pma": bool((best_candidate['tex'].get('atlas') or {}).get('pma')),
                 "best_similarity": best_similarity,
                 "candidates": candidates,
                 "replace": should_replace
@@ -1173,6 +1316,7 @@ class MainWindow(QMainWindow):
         settings.setValue("options/highlight_diff", self.diff_check.isChecked())
         settings.setValue("options/high_quality", self.chk_high_quality.isChecked())
         settings.setValue("options/save_as_original", self.chk_save_original.isChecked())
+        settings.setValue("options/atlas_regions", self.chk_atlas.isChecked())
         settings.setValue("options/scan_all_orig", self.chk_orig_scan_all.isChecked())
         settings.setValue("options/scan_all_mod", self.chk_mod_scan_all.isChecked())
         settings.sync() # Force write to disk immediately
@@ -1215,6 +1359,8 @@ class MainWindow(QMainWindow):
             self.chk_high_quality.setChecked(get_bool_val("options/high_quality", "false"))
 
             self.chk_save_original.setChecked(get_bool_val("options/save_as_original", "true"))
+
+            self.chk_atlas.setChecked(get_bool_val("options/atlas_regions", "true"))
             
             self.chk_orig_scan_all.setChecked(get_bool_val("options/scan_all_orig", "true"))
             self.chk_mod_scan_all.setChecked(get_bool_val("options/scan_all_mod", "true"))
@@ -1281,6 +1427,13 @@ class MainWindow(QMainWindow):
         self.chk_same_res.setToolTip("Only match textures with the same resolution")
         self.chk_same_res.setChecked(False)
         opt_row1.addWidget(self.chk_same_res)
+
+        opt_row1.addSpacing(10)
+        self.chk_atlas = QCheckBox("Atlas regions")
+        self.chk_atlas.setToolTip("Treat .atlas pages (Spine/Live2D) as individual regions instead of one big sheet.\n"
+                                  "Replacements are written back into the ORIGINAL page layout (position/rotation kept).")
+        self.chk_atlas.setChecked(True)
+        opt_row1.addWidget(self.chk_atlas)
 
         opt_row1.addSpacing(10)
         self.chk_sim_filter = QCheckBox("Cut-off:")
@@ -1794,7 +1947,8 @@ class MainWindow(QMainWindow):
                           temp_orig=self.temp_dir_orig, temp_mod=self.temp_dir_mod,
                           mode=self.mode_combo.currentText(),
                           orig_scan_all=self.chk_orig_scan_all.isChecked(),
-                          mod_scan_all=self.chk_mod_scan_all.isChecked())
+                          mod_scan_all=self.chk_mod_scan_all.isChecked(),
+                          atlas_regions=self.chk_atlas.isChecked())
 
     def on_extraction_finished(self, data):
         self.orig_textures = data['orig']
@@ -2978,6 +3132,7 @@ class MainWindow(QMainWindow):
         self.chk_sim_filter.setEnabled(not is_running)
         self.txt_sim_cutoff.setEnabled(not is_running and self.chk_sim_filter.isChecked())
         self.chk_same_res.setEnabled(not is_running)
+        self.chk_atlas.setEnabled(not is_running)
         self.diff_check.setEnabled(not is_running)
         self.chk_show_log.setEnabled(not is_running)
         self.btn_toggle_expand.setEnabled(has_results and not is_running)

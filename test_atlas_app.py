@@ -1,0 +1,214 @@
+"""End-to-end test of the atlas integration (extract -> match -> apply).
+
+Runs the real WorkerThread code on copies of the game data referenced by config.ini,
+so the original game folder is never touched. Run: python test_atlas_app.py
+"""
+import os
+import shutil
+import sys
+import tempfile
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+PROJECT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, PROJECT)
+
+from PIL import Image, ImageChops
+from PyQt6.QtWidgets import QApplication
+
+import atlas as atlas_mod
+import main as app_main
+
+APP = QApplication.instance() or QApplication([])
+CHECKS = 0
+FAILURES = []
+ATLASES = ("10p.atlas", "hina_cg4.atlas")
+
+
+def check(name, condition, detail=None):
+    global CHECKS
+    CHECKS += 1
+    if condition:
+        print(f"  PASS  {name}")
+    else:
+        FAILURES.append(name)
+        print(f"  FAIL  {name}  {detail!r}")
+
+
+def images_equal(a, b):
+    if a is None or b is None or a.size != b.size:
+        return False
+    return ImageChops.difference(a.convert("RGBA"), b.convert("RGBA")).getbbox() is None
+
+
+def read_config_paths():
+    paths = {}
+    section = None
+    with open(os.path.join(PROJECT, "config.ini"), encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1]
+            elif "=" in line and section == "path":
+                key, value = line.split("=", 1)
+                paths[key.strip()] = value.strip()
+    return paths
+
+
+def prepare_pair(root):
+    """Copies the chosen atlases + their page images of both builds into root."""
+    paths = read_config_paths()
+    made = {}
+    for side, key in (("orig", "original"), ("mod", "modified")):
+        src_root = paths.get(key, "")
+        dst = os.path.join(root, side)
+        os.makedirs(dst, exist_ok=True)
+        for name in ATLASES:
+            src_atlas = os.path.join(src_root, "www", name)
+            if not os.path.exists(src_atlas):
+                continue
+            parsed = atlas_mod.parse_atlas(src_atlas)
+            shutil.copy2(src_atlas, os.path.join(dst, name))
+            for page in parsed.pages:
+                page_src = parsed.page_path(page)
+                if os.path.exists(page_src):
+                    shutil.copy2(page_src, os.path.join(dst, page.name))
+        made[side] = dst
+    return made.get("orig"), made.get("mod")
+
+
+def run_worker(task, method, **kwargs):
+    captured = {}
+    worker = app_main.WorkerThread(task, **kwargs)
+    worker.sig_finished.connect(lambda data: captured.setdefault("data", data))
+    worker.sig_error.connect(lambda title, msg: captured.setdefault("error", (title, msg)))
+    getattr(worker, method)()
+    return captured.get("data"), captured.get("error")
+
+
+def test_end_to_end():
+    root = tempfile.mkdtemp(prefix="atlas_e2e_")
+    cwd = os.getcwd()
+    try:
+        orig_dir, mod_dir = prepare_pair(root)
+        if not orig_dir or not mod_dir:
+            print("  SKIP  game folders from config.ini not available")
+            return
+        temp_orig = os.path.join(root, "temp_orig")
+        temp_mod = os.path.join(root, "temp_mod")
+        os.makedirs(temp_orig, exist_ok=True)
+        os.makedirs(temp_mod, exist_ok=True)
+
+        # QSettings("config.ini") is relative, so the workers run inside the temp dir to
+        # avoid touching the real configuration of the app.
+        os.chdir(root)
+
+        print("== extract ==")
+        data, error = run_worker(
+            "extract", "run_extract",
+            orig_dir=orig_dir, mod_dir=mod_dir, temp_orig=temp_orig, temp_mod=temp_mod,
+            mode="Image", orig_scan_all=False, mod_scan_all=False, atlas_regions=True,
+        )
+        check("extract finished without error", error is None, error)
+        if not data:
+            check("extract returned data", False)
+            return
+        orig_textures, mod_textures = data.get("orig", []), data.get("mod", [])
+        print(f"  info  {len(orig_textures)} original items, {len(mod_textures)} modified items")
+        check("extract: regions found on both sides", bool(orig_textures) and bool(mod_textures))
+        check("extract: every item carries atlas metadata",
+              all(t.get("atlas", {}).get("region") for t in orig_textures[:50]))
+        check("extract: region images exist on disk",
+              all(os.path.exists(t["save_path"]) for t in orig_textures[:50]))
+        page_paths = {os.path.normcase(os.path.abspath(t["atlas"]["page_file"])) for t in orig_textures}
+        check("extract: sheet itself is not an item",
+              all(os.path.normcase(os.path.abspath(t["save_path"])) not in page_paths for t in orig_textures))
+        sample = orig_textures[0]
+        check("extract: item size matches its region rect",
+              (sample["width"], sample["height"]) == (sample["atlas"]["sprite_size"][0],
+                                                      sample["atlas"]["sprite_size"][1]),
+              (sample["name"], sample["width"], sample["height"], sample["atlas"]["sprite_size"]))
+
+        print("== match ==")
+        results, error = run_worker(
+            "match", "run_match",
+            orig_textures=orig_textures, mod_textures=mod_textures,
+            num_candidates=5, unchecked_same=False, same_res=False,
+            filter_enabled=False, sim_cutoff=0.5,
+        )
+        check("match finished without error", error is None, error)
+        results = results or []
+        check("match: one result per original item", len(results) == len(orig_textures),
+              (len(results), len(orig_textures)))
+        matched = [r for r in results if r.get("match_file")]
+        check("match: atlas regions were paired", len(matched) == len(results),
+              f"{len(matched)}/{len(results)}")
+        atlas_exact = [r for r in matched
+                       if any(c.get("is_exact") for c in r.get("candidates", [])
+                              if c["save_path"] == r["match_file"])]
+        check("match: region identity wins over similarity", len(atlas_exact) >= len(matched) * 0.9,
+              f"{len(atlas_exact)}/{len(matched)} marked exact")
+        check("match: pma flag propagated for apply", all("match_pma" in r for r in matched))
+
+        print("== apply ==")
+        before = {}
+        for res in matched:
+            meta = res["original"]["atlas"]
+            before.setdefault(meta["page_file"], atlas_mod.load_page_image(meta["page_file"]))
+        to_replace = matched[:5]
+        data, error = run_worker(
+            "apply", "run_apply",
+            to_replace=to_replace, orig_dir=orig_dir, mod_dir=mod_dir,
+            temp_orig=temp_orig, temp_mod=temp_mod, mode="Image",
+            high_quality=False, save_as_original=True,
+        )
+        check("apply finished without error", error is None, error)
+        check("apply reports success", bool(data and data.get("success")), data)
+
+        res = to_replace[0]
+        meta = res["original"]["atlas"]
+        page_path = meta["page_file"]
+        after = atlas_mod.load_page_image(page_path)
+        orig_page = before.get(page_path)
+        check("apply: page readable after write", after is not None and orig_page is not None)
+        if after is None or orig_page is None:
+            return
+        check(f"apply: page size kept ({os.path.basename(page_path)})", after.size == orig_page.size,
+              (after.size, orig_page.size))
+        region = atlas_mod.region_from_metadata(meta)
+        check("apply: region metadata round-trips", region is not None)
+        if region is not None:
+            # the app packs the mod piece into the original footprint, so compare the raw
+            # page rect with the packed piece (both in page orientation)
+            piece = Image.open(res["match_file"]).convert("RGBA")
+            want = atlas_mod.pack_region(piece, region)
+            if region.pma and not res.get("match_pma"):
+                want = atlas_mod.premultiply_alpha(want)
+            if want.size != (region.packed_width, region.packed_height):
+                want = want.resize((region.packed_width, region.packed_height), Image.Resampling.LANCZOS)
+            x, y, w, h = region.rect
+            got = after.crop((x, y, x + w, y + h))
+            check(f"apply: region '{res['original']['name']}' written at the original rect",
+                  images_equal(want, got))
+            others = [r for r in atlas_mod.parse_atlas(meta["atlas_file"]).pages[0].regions
+                      if atlas_mod.region_key(r.name) != atlas_mod.region_key(meta["region"])]
+            if others:
+                other = others[0]
+                check(f"apply: untouched region '{other.name}' unchanged",
+                      images_equal(atlas_mod.unpack_region(after, other), atlas_mod.unpack_region(orig_page, other)))
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def main():
+    test_end_to_end()
+    print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")
+    if FAILURES:
+        print("FAILED:", FAILURES)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
