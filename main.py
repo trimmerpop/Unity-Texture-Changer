@@ -3785,20 +3785,26 @@ class MainWindow(QMainWindow):
                                       Qt.AspectRatioMode.IgnoreAspectRatio, 
                                       Qt.TransformationMode.SmoothTransformation)
         painter = QPainter(pix)
-        
-        # 2px XOR border for higher contrast
-        pen = QPen(Qt.GlobalColor.white)
-        pen.setWidth(2)
-        painter.setPen(pen)
-        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Xor)
-        
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
         x, y, w, h = self.last_viewport
         # Check if viewport is actually a sub-area
         if w < 0.99 or h < 0.99:
-            rect = QRect(int(x * pix.width()), int(y * pix.height()), 
+            rect = QRect(int(x * pix.width()), int(y * pix.height()),
                          int(w * pix.width()), int(h * pix.height()))
+            # The thumbnail can be a grayscale difference image with yellow marks, so the
+            # frame needs to read on both: a dark halo (visible on yellow) around a bright
+            # magenta line (visible on every gray level, unlike white XOR which vanished on
+            # light areas).
+            halo = QPen(QColor(0, 0, 0, 180))
+            halo.setWidth(4)
+            painter.setPen(halo)
+            painter.drawRect(rect.adjusted(-1, -1, 1, 1))
+            frame = QPen(QColor(255, 0, 255))  # magenta
+            frame.setWidth(2)
+            painter.setPen(frame)
             painter.drawRect(rect)
-        
+
         painter.end()
         self.thumbnail_preview.setPixmap(pix)
 

@@ -900,9 +900,64 @@ def test_restart_restore():
         remove_tree(root)
 
 
+def test_thumbnail_viewport_frame():
+    """The thumbnail frame must stand out on a grayscale + yellow difference image."""
+    from PyQt6.QtGui import QImage, QPixmap
+    import numpy as np
+
+    window = app_main.MainWindow()
+    try:
+        # a grayscale background with a yellow difference band (the diff thumbnail look)
+        image = QImage(200, 200, QImage.Format.Format_RGBA8888)
+        image.fill(0)
+        data = np.zeros((200, 200, 4), dtype=np.uint8)
+        data[:, :, 0] = 110      # gray
+        data[:, :, 1] = 110
+        data[:, :, 2] = 110
+        data[:, :, 3] = 255
+        data[60:120, :] = (255, 255, 0, 255)   # yellow band (RGBA)
+        image = QImage(data.tobytes(), 200, 200, 200 * 4, QImage.Format.Format_RGBA8888).copy()
+
+        window.current_orig_img = "thumb"
+        window.current_pix = QPixmap.fromImage(image)
+        window.thumbnail_preview.setFixedSize(200, 200)
+        window.last_viewport = (0.25, 0.25, 0.5, 0.5)
+        window.draw_thumbnail_viewport()
+
+        frame = window.thumbnail_preview.pixmap()
+        check("frame: thumbnail pixmap drawn", frame is not None and not frame.isNull())
+        if frame is None or frame.isNull():
+            return
+        rgba = frame.toImage().convertToFormat(QImage.Format.Format_RGBA8888)
+        probe_dir = tempfile.mkdtemp(prefix="frame_probe_", dir=os.path.dirname(PROJECT))
+        probe_png = os.path.join(probe_dir, "frame.png")
+        check("frame: thumbnail pixmap saved", frame.save(probe_png, "PNG"))
+        try:
+            with Image.open(probe_png) as handle:
+                arr = np.asarray(handle.convert("RGBA"))
+        finally:
+            remove_tree(probe_dir)
+
+        magenta = int(np.count_nonzero((arr[:, :, 0] > 200) & (arr[:, :, 1] < 60)
+                                       & (arr[:, :, 2] > 200)))
+        dark = int(np.count_nonzero(arr[:, :, :3].max(axis=2) < 40))
+        check("frame: the viewport frame is drawn in magenta", magenta > 100, magenta)
+        check("frame: a dark halo makes it readable on yellow", dark > 100, dark)
+        # the frame must be a rectangle around the viewport, not a filled block
+        x, y, w, h = window.last_viewport
+        inner = arr[int((y + 0.05) * arr.shape[0]):int((y + h - 0.05) * arr.shape[0]),
+                    int((x + 0.05) * arr.shape[1]):int((x + w - 0.05) * arr.shape[1])]
+        yellow_left = int(np.count_nonzero((inner[:, :, 0] > 240) & (inner[:, :, 1] > 240)
+                                          & (inner[:, :, 2] < 60)))
+        check("frame: the area inside the frame is left untouched", yellow_left > 100, yellow_left)
+    finally:
+        window.close()
+
+
 def main():
     test_legacy_region_apply()
     test_assembled_preview_unit()
+    test_thumbnail_viewport_frame()
     test_page_mode()
     test_atlas_disabled()
     test_stale_metadata()
