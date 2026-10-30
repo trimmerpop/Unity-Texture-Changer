@@ -307,6 +307,16 @@ def test_page_mode():
                     kept += 1
         check("page: changed pieces now carry the modified art", written > 0, (written, kept))
 
+        print("== recalc after apply ==")
+        window = app_main.MainWindow()
+        window.results = results
+        window.mod_textures = mod_items
+        window._recalculate_item_similarity(res)
+        check("page: recalculated row keeps the atlas column",
+              "% (" in (res.get("atlas_text") or "") and res.get("atlas_state") == "page",
+              (res.get("atlas_text"), res.get("atlas_state")))
+        window.close()
+
         print("== UI column (page mode) ==")
         try:
             window = app_main.MainWindow()

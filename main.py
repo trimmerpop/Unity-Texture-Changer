@@ -1433,6 +1433,22 @@ class PreviewWorker(QObject):
 
     @pyqtSlot(int, str, str, bool)
     def run_preview(self, request_id, path1, path2, show_diff):
+        try:
+            self._run_preview(request_id, path1, path2, show_diff)
+        except Exception as error:
+            # Never leave the comparison panel in the "Loading..." state
+            print(f"Preview failed: {error}")
+            try:
+                if request_id == self.parent_window.current_preview_id:
+                    self.sig_preview_ready.emit({
+                        "request_id": request_id, "img1": None, "img2": None,
+                        "thumb_img": None, "main_diff_img": None,
+                        "path1": path1, "path2": path2,
+                    })
+            except Exception:
+                pass
+
+    def _run_preview(self, request_id, path1, path2, show_diff):
         # 1. Check if this request is already outdated
         if request_id != self.parent_window.current_preview_id:
             return
@@ -3410,14 +3426,34 @@ class MainWindow(QMainWindow):
         self.draw_thumbnail_viewport()
         
         # 2. Update Comparison Labels
-        
-        # 2. Update Comparison Labels
-        if main_diff_pix:
+        if pix1.isNull():
+            left = self.comp_widget.original_label
+            left.main_pixmap = None
+            left.setText("cannot load image")
+            left.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            left.setFixedSize(self.comp_widget.original_scroll.viewport().size())
+            self.log(f"Preview: could not load {path1}")
+        elif main_diff_pix:
             self.comp_widget.original_label.set_image(main_diff_pix)
         else:
             self.comp_widget.original_label.set_image(pix1)
         
-        self.comp_widget.matched_label.set_image(pix2)
+        if pix2.isNull():
+            # Never leave the panel silently empty: say why and log the missing path
+            label = self.comp_widget.matched_label
+            label.main_pixmap = None
+            if not path2:
+                label.setText("no match selected")
+            elif not os.path.exists(path2):
+                label.setText("mod image missing")
+                self.log(f"Preview: mod image not found: {path2}")
+            else:
+                label.setText("cannot load mod image")
+                self.log(f"Preview: could not load mod image: {path2}")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            label.setFixedSize(self.comp_widget.matched_scroll.viewport().size())
+        else:
+            self.comp_widget.matched_label.set_image(pix2)
         
         # 3. Restore Viewport (Using singleShot to ensure scrollbars have updated ranges)
         QTimer.singleShot(0, lambda: self.comp_widget.set_scroll_normalized(self.last_viewport[0], self.last_viewport[1]))
@@ -3430,6 +3466,8 @@ class MainWindow(QMainWindow):
         if not orig_tex: return
         path1 = orig_tex['save_path']
         path2 = match_tex['save_path'] if match_tex else None
+        if not path2:
+            self.log(f"No match selected for {orig_tex.get('name', '?')} - the right panel stays empty.")
         
         # Viewport preservation: Don't reset if we want to maintain zoom/scroll across items
         # if path1 != self.comp_widget.current_img1_path or path2 != self.comp_widget.current_img2_path:
@@ -3847,15 +3885,23 @@ class MainWindow(QMainWindow):
             
             # Refine candidates with deep comparison
             all_potentials = []
-            from similarity import compare_images
+            from similarity import compare_images, compare_images_fast
+            o_page = orig.get('atlas_page') or {}
             for m_tex in candidate_pool.values():
-                refined_sim = compare_images(orig['save_path'], m_tex['save_path'], trim=is_atlas_item)
+                refined_sim = compare_images_fast(orig['save_path'], m_tex['save_path'], trim=is_atlas_item)
                 m_atlas_strong, m_atlas_weak = atlas_keys(m_tex)
                 is_atlas_pair = bool(o_atlas_strong) and (
                     m_atlas_strong == o_atlas_strong or (bool(o_atlas_weak) and m_atlas_weak == o_atlas_weak)
                 )
                 is_exact = is_atlas_pair or (m_tex.get('name', '').lower() == o_name_lower)
                 geo_state, geo_text, geo_detail = atlas_geometry(orig, m_tex)
+                if o_page and m_tex.get('atlas_page'):
+                    # keep the page overlap after an apply (otherwise the Atlas column would
+                    # fall back to "-" once the result is recalculated)
+                    stats = atlas_page_stats(o_page, m_tex['atlas_page'], verify=False)
+                    if stats.total > 0:
+                        geo_state, geo_text, geo_detail = "page", stats.summary(), stats.detail()
+                        refined_sim = max(refined_sim, stats.ratio)
                 is_same_res = (m_tex.get('width') == orig.get('width') and m_tex.get('height') == orig.get('height'))
                 all_potentials.append({
                     'tex': m_tex, 'similarity': refined_sim, 
