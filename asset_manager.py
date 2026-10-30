@@ -13,6 +13,8 @@ from UnityPy.export.Texture2DConverter import get_image_from_texture2d, parse_im
 from UnityPy.files import BundleFile, SerializedFile
 from UnityPy.helpers.UnityVersion import UnityVersion
 
+import unity_atlas
+
 # Picture extensions handled by the whole app. Every file listed here is decoded by
 # similarity.load_image() (OpenCV -> Pillow fallback) and by PIL.Image.open(), i.e. only
 # decoders that already ship with opencv-python / Pillow, so no extra dependency is needed.
@@ -266,7 +268,8 @@ class AssetManager:
             log_callback(f"  [VERSION] Engine version unknown, forced {self.version_string(fallback)} on {updated} file(s).")
         return fallback
 
-    def extract_textures(self, game_dir, output_dir, progress_callback=None, log_callback=None, scan_all=False):
+    def extract_textures(self, game_dir, output_dir, progress_callback=None, log_callback=None,
+                         scan_all=False, atlas_pages=True):
         found_textures = []
         if not os.path.exists(output_dir): os.makedirs(output_dir)
             
@@ -317,9 +320,29 @@ class AssetManager:
                 # resolve_engine_version() for why the types differ per file kind).
                 engine_version = self.resolve_engine_version(env, log)
 
+                # Atlas pages inside a Unity build: sprite rects (native sprite atlas) and
+                # Spine .atlas text assets are collected first, then attached to the textures
+                # they belong to (see unity_atlas.attach_pages).
+                sprite_pieces = {}
+                atlas_texts = []
+                if atlas_pages:
+                    try:
+                        objects = list(env.objects)
+                        sprite_pieces = unity_atlas.scan_sprites(objects, log)
+                        atlas_texts = unity_atlas.scan_text_assets(objects, log)
+                        if sprite_pieces:
+                            log(f"  [ATLAS] {sum(len(v) for v in sprite_pieces.values())} sprite(s) "
+                                f"on {len(sprite_pieces)} texture(s)")
+                        for text_name, _text in atlas_texts:
+                            log(f"  [ATLAS] atlas text asset: {text_name}")
+                    except Exception as error:
+                        log(f"  [ATLAS] atlas scan failed: {error}")
+                        sprite_pieces, atlas_texts = {}, []
+
                 obj_count = 0
                 type_counts = {}
                 file_textures = 0
+                file_entries = []
                 
                 for obj in env.objects:
                     obj_count += 1
@@ -418,8 +441,18 @@ class AssetManager:
                                 "height": height,
                                 "size": len(buf.getvalue())
                             })
+                            file_entries.append(found_textures[-1])
                             file_textures += 1
                         except: continue
+                if atlas_pages and file_entries:
+                    try:
+                        created = unity_atlas.attach_pages(file_entries, sprite_pieces,
+                                                           atlas_texts, output_dir, log)
+                        if created:
+                            log(f"  [ATLAS] {created} page item(s) in "
+                                f"{os.path.basename(path)}")
+                    except Exception as error:
+                        log(f"  [ATLAS] page attachment failed: {error}")
                 log(f"  Finished {os.path.basename(path)}: Found {file_textures} textures.")
             except Exception as e:
                 log(f"Error loading {os.path.basename(path)}: {e}")

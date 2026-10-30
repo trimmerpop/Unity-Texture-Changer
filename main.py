@@ -256,7 +256,8 @@ def atlas_keys(texture):
 
     Region items:     strong = "<atlas file>|<region>", weak = "<region>"
     Page items:       strong = "<atlas file>|<page>",   weak = "<page>"
-    Both are empty for plain images and Unity textures.
+    Unity page items: strong = "unity|<texture name>",  weak = "<texture name>"
+    All are empty for plain images and Unity textures without page data.
     """
     meta = texture.get('atlas') or {}
     name = meta.get('region')
@@ -268,6 +269,11 @@ def atlas_keys(texture):
 
     page = texture.get('atlas_page') or {}
     if page:
+        if page.get('kind') == 'unity-page':
+            # the extracted PNG carries the path_id, which differs between builds, so the
+            # texture name is the identity here
+            texture_name = atlas_mod.region_key(page.get('page_name') or texture.get('name') or '')
+            return f"unity|{texture_name}", texture_name
         atlas_name = os.path.basename(page.get('atlas_file') or "").lower()
         page_name = atlas_mod.region_key(os.path.basename(page.get('page_file') or ""))
         return f"{atlas_name}|{page_name}", page_name
@@ -383,7 +389,14 @@ _ATLAS_REGION_CACHE = {}
 
 
 def atlas_page_regions(meta):
-    """Regions of one atlas page, parsed once per .atlas file (cached)."""
+    """Regions of one atlas page.
+
+    Unity sprite pages keep their rects inline (there is no .atlas file), Spine pages are
+    parsed from the .atlas file next to them (cached per file).
+    """
+    inline = meta.get('regions')
+    if inline:
+        return atlas_mod.regions_from_metadata(inline)
     path = meta.get('atlas_file') or ''
     if not path:
         return []
@@ -710,7 +723,10 @@ class WorkerThread(QThread):
                         continue
                     self.sig_progress.emit(int((processed_count/total)*100),
                                            f"Updating atlas page {os.path.basename(page_path)}...")
-                    mod_meta = {"atlas_file": res.get('match_atlas_file', ''), "page_file": mod_page_path}
+                    mod_meta = res.get('match_page_meta') or {}
+                    if not mod_meta:
+                        mod_meta = {"atlas_file": res.get('match_atlas_file', ''),
+                                    "page_file": mod_page_path}
                     updated = self._apply_atlas_page(page_path, meta, mod_meta,
                                                      bool(res.get('match_page_pma')))
                     if updated:
@@ -718,13 +734,24 @@ class WorkerThread(QThread):
                         self.sig_log.emit(f"Atlas page updated: {os.path.basename(page_path)} "
                                           f"({updated} piece(s) changed, original layout kept)")
                         # refresh the preview item so the tree/thumbnail shows the new state
-                        preview = atlas_mod.load_page_image(page_path)
-                        if preview is not None:
-                            preview.thumbnail((1024, 1024), Image.Resampling.BOX)
-                            try:
-                                preview.save(res['original']['save_path'], format="PNG")
-                            except Exception:
-                                pass
+                        # (Unity page items use the texture itself as preview: never shrink it)
+                        save_path = res['original'].get('save_path') or ''
+                        if save_path and os.path.normcase(save_path) != os.path.normcase(page_path):
+                            preview = atlas_mod.load_page_image(page_path)
+                            if preview is not None:
+                                preview.thumbnail((1024, 1024), Image.Resampling.BOX)
+                                try:
+                                    preview.save(save_path, format="PNG")
+                                except Exception:
+                                    pass
+                        # a page that lives inside a Unity asset has to be pushed back as a
+                        # texture replacement (the composite is the extracted texture PNG)
+                        asset = res['original'].get('source_asset')
+                        path_id = res['original'].get('path_id')
+                        if asset and path_id is not None:
+                            group = unity_groups.setdefault(asset, {'replacements': [], 'results': []})
+                            group['replacements'].append((path_id, page_path))
+                            group['results'].append(res)
                     else:
                         self.sig_log.emit(f"Atlas page unchanged: {os.path.basename(page_path)}")
                     processed_count += 1
@@ -772,6 +799,8 @@ class WorkerThread(QThread):
         
         # 3. PHASE 1: Process Unity Asset Replacements
         if unity_groups:
+            # atlas pages added their (composited) texture to the queue here
+            total_unity = sum(len(data['replacements']) for data in unity_groups.values())
             self.sig_log.emit(f"Processing Unity assets for {total_unity} replacements...")
             for src_file, group_data in unity_groups.items():
                 original_src = src_file
@@ -804,6 +833,9 @@ class WorkerThread(QThread):
                     # Sync successful replacements to original file paths
                     for res in group_data['results']:
                         try:
+                            # atlas pages are already composited into their own page image
+                            if (res.get('original') or {}).get('atlas_page'):
+                                continue
                             # Copy the modified image to overwrite the original extracted image
                             if res.get('match_file'):
                                 self._write_replacement_image(res['match_file'], res['original']['save_path'])
@@ -1183,7 +1215,8 @@ class WorkerThread(QThread):
                     textures = am.extract_textures(current_target_dir, temp_path, 
                                                 progress_callback=progress_cb, 
                                                 log_callback=self.sig_log.emit,
-                                                scan_all=scan_all)
+                                                scan_all=scan_all,
+                                                atlas_pages=bool(self.args.get('atlas_enabled', True)))
             except Exception as e:
                 self.sig_log.emit(f"ERROR: Extraction failed for {label}: {e}")
                 import traceback
@@ -1527,6 +1560,8 @@ class WorkerThread(QThread):
                 "match_page_file": best_page_meta.get('page_file', ''),
                 "match_atlas_file": best_page_meta.get('atlas_file', ''),
                 "match_page_pma": bool(best_page_meta.get('pma')),
+                # full block: Unity pages keep their rects inline, so page_file alone is not enough
+                "match_page_meta": best_page_meta,
                 "replace": should_replace
             })
             if best_candidate['match_by'] == "atlas":
@@ -2823,6 +2858,17 @@ class MainWindow(QMainWindow):
         if not self.mod_textures:
             self.mod_textures = self.scan_image_folder(self.mod_path.text(), self.temp_dir_mod)
             self._normalize_textures(self.mod_textures, self.temp_dir_mod)
+
+        # An extraction made before Unity page support (or with atlas handling off) holds
+        # plain Unity textures; tell the user instead of silently matching without pages.
+        if self.chk_atlas.isChecked():
+            plain_unity = [t for t in list(self.orig_textures) + list(self.mod_textures)
+                           if t.get('source_asset') and t.get('path_id') is not None
+                           and not t.get('atlas_page')]
+            if plain_unity:
+                self.log(f"{len(plain_unity)} Unity texture(s) carry no atlas page data. "
+                         f"Run Extract again with 'Check Atlas' on to pick up sprite atlases "
+                         f"and Spine atlas text assets.")
 
         self.progress_bar.setValue(0)
         self.progress_label.setText("Matching...")
@@ -4230,6 +4276,10 @@ class MainWindow(QMainWindow):
             res['match_file'] = best_candidate['tex']['save_path']
             res['best_similarity'] = best_candidate['similarity']
             res['match_pma'] = bool((best_candidate['tex'].get('atlas') or {}).get('pma'))
+            # the apply phase composites the changed pieces into the matched page
+            res['match_page_meta'] = best_candidate['tex'].get('atlas_page') or {}
+            res['match_page_file'] = res['match_page_meta'].get('page_file', '')
+            res['match_atlas_file'] = res['match_page_meta'].get('atlas_file', '')
             res['atlas_state'] = best_candidate['atlas_state']
             res['atlas_text'] = best_candidate['atlas_text']
             res['atlas_detail'] = best_candidate['atlas_detail']

@@ -954,10 +954,125 @@ def test_thumbnail_viewport_frame():
         window.close()
 
 
+def make_unity_page(root, tag, colors, positions, path_id, size=(200, 100)):
+    """Builds a Unity-style page item: one texture + inline sprite rects (no .atlas file)."""
+    import unity_atlas
+
+    path = os.path.join(root, f"{tag}.png")
+    page = Image.new("RGBA", size, (0, 0, 0, 0))
+    pieces = []
+    for name, color, (x, y) in (("piece_a", colors["a"], positions["a"]),
+                                ("piece_b", colors["b"], positions["b"])):
+        width, height = (40, 40) if name == "piece_a" else (60, 20)
+        page.paste(Image.new("RGBA", (width, height), color), (x, y))
+        pieces.append({
+            "kind": "atlas", "region": name, "atlas_file": "", "page_file": path,
+            "rect": [x, y, width, height], "sprite_size": [width, height], "rotate": 0,
+            "index": -1, "offset": [0, 0], "orig_size": [width, height], "pma": False,
+            "scale": 1.0,
+        })
+    page.save(path, format="PNG")
+    meta = unity_atlas.page_metadata(pieces, path, size, page_name="atlas_page")
+    meta["digests"] = atlas_mod.page_piece_digests(page, atlas_mod.regions_from_metadata(pieces))
+    return {
+        "name": "atlas_page",
+        "file": os.path.basename(path),
+        "save_path": path,
+        "width": size[0],
+        "height": size[1],
+        "size": os.path.getsize(path),
+        "path_id": path_id,
+        "source_asset": os.path.join(root, "fake.assets"),
+        "atlas_page": meta,
+    }
+
+
+def test_unity_page_items():
+    """Unity style pages (inline regions, no .atlas file): match, preview and apply."""
+    root = tempfile.mkdtemp(prefix="unity_pages_", dir=os.path.dirname(PROJECT))
+    try:
+        red, blue, green = (220, 30, 30, 255), (30, 30, 220, 255), (30, 200, 30, 255)
+        orig = make_unity_page(root, "orig_page", {"a": red, "b": green},
+                               {"a": (0, 0), "b": (40, 0)}, path_id=111)
+        # the mod build repacked the sprites and changed piece_a
+        mod = make_unity_page(root, "mod_page", {"a": blue, "b": green},
+                              {"a": (100, 40), "b": (10, 60)}, path_id=222)
+        temp_dir = os.path.join(root, "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        check("unity: page regions are read from metadata",
+              len(app_main.atlas_page_regions(orig["atlas_page"])) == 2)
+        check("unity: identity key uses the texture name",
+              app_main.atlas_keys(orig) == ("unity|atlas_page", "atlas_page"),
+              app_main.atlas_keys(orig))
+
+        results, error = run_worker("match", "run_match", orig_textures=[orig],
+                                    mod_textures=[mod], num_candidates=5,
+                                    unchecked_same=False, same_res=False,
+                                    filter_enabled=False, sim_cutoff=0.5)
+        check("unity: match finished without error", error is None, error)
+        results = results or []
+        check("unity: one result", len(results) == 1, len(results))
+        if not results:
+            return
+        res = results[0]
+        stats = res.get("piece_stats") or {}
+        print(f"  info  unity page: {stats}")
+        check("unity: paired by atlas identity", res.get("match_by") == "atlas",
+              res.get("match_by"))
+        check("unity: piece overlap is computed", res.get("atlas_state") == "page",
+              res.get("atlas_state"))
+        check("unity: one piece changed, both repacked",
+              stats.get("changed") == 1 and stats.get("moved") == 2, stats)
+        check("unity: ratio is same pieces / all pieces",
+              abs((res.get("atlas_ratio") or 0) - 0.5) < 1e-6, res.get("atlas_ratio"))
+
+        assembled = app_main.assemble_atlas_preview(
+            orig["atlas_page"], mod["atlas_page"], os.path.join(root, "asm"),
+            orig_preview_path=orig["save_path"])
+        check("unity: assembled preview built", bool(assembled) and os.path.exists(assembled),
+              assembled)
+        if assembled:
+            page = atlas_mod.load_page_image(assembled)
+            regions = app_main.atlas_page_regions(orig["atlas_page"])
+            if page is None:
+                check("unity: assembled page readable", False)
+                return
+            changed = atlas_mod.unpack_region(page, next(r for r in regions
+                                                         if r.name == "piece_a"))
+            kept = atlas_mod.unpack_region(page, next(r for r in regions
+                                                      if r.name == "piece_b"))
+            check("unity: assembled page carries the mod piece",
+                  images_equal(changed, Image.new("RGBA", (40, 40), blue)))
+            check("unity: assembled page keeps the unchanged piece",
+                  images_equal(kept, Image.new("RGBA", (60, 20), green)))
+
+        # apply: the page is composited in place, then queued as a texture replacement
+        data, error = run_worker("apply", "run_apply", to_replace=[res],
+                                 orig_dir=root, mod_dir=root,
+                                 temp_orig=temp_dir, temp_mod=temp_dir, mode="Unity",
+                                 high_quality=False, save_as_original=True)
+        check("unity: apply finished without error", error is None, error)
+        check("unity: apply wrote the changed piece", bool(data and data.get("success")), data)
+        page = atlas_mod.load_page_image(orig["save_path"])
+        regions = app_main.atlas_page_regions(orig["atlas_page"])
+        if page is None:
+            check("unity: applied page readable", False)
+            return
+        piece_a = atlas_mod.unpack_region(page, next(r for r in regions if r.name == "piece_a"))
+        check("unity: page file now holds the mod art",
+              images_equal(piece_a, Image.new("RGBA", (40, 40), blue)))
+        check("unity: page keeps its full resolution",
+              page.size == (orig["width"], orig["height"]), page.size)
+    finally:
+        remove_tree(root)
+
+
 def main():
     test_legacy_region_apply()
     test_assembled_preview_unit()
     test_thumbnail_viewport_frame()
+    test_unity_page_items()
     test_page_mode()
     test_atlas_disabled()
     test_stale_metadata()

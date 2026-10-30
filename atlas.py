@@ -421,6 +421,20 @@ def region_from_metadata(meta: dict) -> Optional[AtlasRegion]:
     return region
 
 
+def regions_from_metadata(entries) -> List[AtlasRegion]:
+    """Rebuilds page regions from inline metadata entries (Unity sprite pages).
+
+    A page taken from a Unity Texture2D has no .atlas file: its rects are stored in the
+    metadata itself, so the page logic can work without one.
+    """
+    regions: List[AtlasRegion] = []
+    for entry in entries or []:
+        region = region_from_metadata(entry)
+        if region is not None:
+            regions.append(region)
+    return regions
+
+
 def find_region(atlas: AtlasFile, region_name: str,
                 page_name: str = "") -> Optional[AtlasRegion]:
     """Looks a region up by name (optionally restricted to one page)."""
@@ -538,20 +552,20 @@ def page_piece_digests(page_image: Image.Image, regions: Sequence[AtlasRegion]) 
 def pieces_near_identical(a: Image.Image, b: Image.Image, tolerance: Optional[dict] = None) -> bool:
     """Pixel tolerance check for pieces whose trimmed digest differs.
 
-    Absorbs re-encode noise but not real edits: a small mosaic patch still shows a large
-    peak difference and is therefore reported as changed.
+    Absorbs re-encode noise but not real edits. Every colour channel is compared (not just
+    the luminance): a re-colour with the same brightness, which is a common edit, still has a
+    large peak difference and is therefore reported as changed.
     """
     tol = tolerance or PIECE_TOLERANCE
     ta = np.asarray(trim_alpha(a))
     tb = np.asarray(trim_alpha(b))
     if ta.shape != tb.shape:
         return False
-    gray_a = ta[:, :, :3].astype(np.int16).mean(axis=2)
-    gray_b = tb[:, :, :3].astype(np.int16).mean(axis=2)
-    diff = np.abs(gray_a - gray_b)
+    diff = np.abs(ta[:, :, :3].astype(np.int16) - tb[:, :, :3].astype(np.int16))
+    per_pixel = diff.max(axis=2)
     return (float(diff.mean()) <= tol["mae"]
-            and float((diff > 8).mean() * 100) <= tol["changed_pct"]
-            and float(diff.max()) <= tol["peak"])
+            and float((per_pixel > 8).mean() * 100) <= tol["changed_pct"]
+            and float(per_pixel.max()) <= tol["peak"])
 
 
 @dataclass
