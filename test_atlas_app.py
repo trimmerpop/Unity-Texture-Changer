@@ -3,6 +3,7 @@
 Runs the real WorkerThread code on copies of the game data referenced by config.ini,
 so the original game folder is never touched. Run: python test_atlas_app.py
 """
+import json
 import os
 import shutil
 import sys
@@ -375,10 +376,77 @@ def test_atlas_disabled():
         remove_tree(root)
 
 
+def test_stale_metadata():
+    """An extraction stored by an older version must be re-extracted, not reused."""
+    root = tempfile.mkdtemp(prefix="atlas_stale_", dir=os.path.dirname(PROJECT))
+    cwd = os.getcwd()
+    try:
+        orig_dir, mod_dir = prepare_pair(root)
+        if not orig_dir or not mod_dir:
+            print("  SKIP  game folders from config.ini not available")
+            return
+        temp_orig = os.path.join(root, "temp_orig")
+        temp_mod = os.path.join(root, "temp_mod")
+        os.makedirs(temp_orig, exist_ok=True)
+        os.makedirs(temp_mod, exist_ok=True)
+        os.chdir(root)
+
+        data, error = run_worker(
+            "extract", "run_extract",
+            orig_dir=orig_dir, mod_dir=mod_dir, temp_orig=temp_orig, temp_mod=temp_mod,
+            mode="Image", orig_scan_all=False, mod_scan_all=False, atlas_enabled=True,
+        )
+        check("stale: first extraction ok", error is None and bool(data), error)
+        fresh = (data or {}).get("orig", [])
+        check("stale: page items produced", all(t.get("atlas_page") for t in fresh), len(fresh))
+
+        # 1) legacy per-region metadata must trigger a re-extraction
+        legacy = [{"name": "old piece", "file": "old.png", "save_path": os.path.join(temp_orig, "old.png"),
+                   "atlas": {"kind": "atlas", "region": "old piece", "atlas_file": os.path.join(orig_dir, "10p.atlas"),
+                             "page_file": os.path.join(orig_dir, "10p.png"), "rect": [0, 0, 8, 8],
+                             "sprite_size": [8, 8], "rotate": 0, "pma": True}}]
+        with open(os.path.join(temp_orig, "metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump(legacy, handle)
+        logs = []
+        worker = app_main.WorkerThread(
+            "extract", orig_dir=orig_dir, mod_dir=mod_dir, temp_orig=temp_orig, temp_mod=temp_mod,
+            mode="Image", orig_scan_all=False, mod_scan_all=False, atlas_enabled=True)
+        worker.sig_log.connect(logs.append)
+        captured = {}
+        worker.sig_finished.connect(lambda d: captured.setdefault("d", d))
+        worker.run_extract()
+        out = captured.get("d") or {}
+        check("stale: legacy metadata is not reused",
+              any("old per-region layout; re-extracting" in line for line in logs),
+              [line for line in logs if "Stored" in line][:3])
+        check("stale: page items are rebuilt", all(t.get("atlas_page") for t in out.get("orig", [])))
+
+        # 2) page metadata without digests must trigger a re-extraction as well
+        stripped = [{k: v for k, v in item.items() if k != "atlas_page"} for item in fresh[:1]]
+        stripped[0]["atlas_page"] = {"kind": "atlas-page", "atlas_file": "", "page_file": "", "pieces": 0}
+        with open(os.path.join(temp_orig, "metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump(stripped, handle)
+        logs = []
+        worker = app_main.WorkerThread(
+            "extract", orig_dir=orig_dir, mod_dir=mod_dir, temp_orig=temp_orig, temp_mod=temp_mod,
+            mode="Image", orig_scan_all=False, mod_scan_all=False, atlas_enabled=True)
+        worker.sig_log.connect(logs.append)
+        captured = {}
+        worker.sig_finished.connect(lambda d: captured.setdefault("d", d))
+        worker.run_extract()
+        check("stale: missing piece data forces re-extraction",
+              any("lacks atlas piece data; re-extracting" in line for line in logs),
+              [line for line in logs if "Stored" in line][:3])
+    finally:
+        os.chdir(cwd)
+        remove_tree(root)
+
+
 def main():
     test_legacy_region_apply()
     test_page_mode()
     test_atlas_disabled()
+    test_stale_metadata()
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")
     if FAILURES:

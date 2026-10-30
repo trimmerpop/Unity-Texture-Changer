@@ -13,11 +13,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt6.QtGui import QIcon, QAction, QDragEnterEvent, QDropEvent, QMouseEvent, QWheelEvent, QPixmap, QImage, QPainter, QPen, QFontMetrics, QColor, QBrush
 from PIL import Image
 from asset_manager import AssetManager, SUPPORTED_IMAGE_EXTS, convert_image_format
-from similarity import get_image_hash, hamming_similarity, compare_images, load_image
+from similarity import (get_image_hash, hamming_similarity, compare_images, compare_images_fast,
+                        load_image, load_small, clear_small_cache)
 from comparison_widget import ComparisonWidget
 import atlas as atlas_mod
 import cv2
 import time
+from concurrent.futures import ThreadPoolExecutor
 from packaging import version
 import ctypes
 
@@ -290,23 +292,28 @@ def atlas_page_regions(meta):
     return []
 
 
-def atlas_page_stats(orig_meta, mod_meta):
+def atlas_page_stats(orig_meta, mod_meta, verify=True):
     """Piece-overlap statistics between two atlas pages (same pieces / all pieces).
 
-    The fast pass compares trimmed md5 digests only. When something differs, both pages are
-    decoded once so re-encoded art is not counted as a change (a real edit, e.g. a small
-    mosaic patch, stays "changed" thanks to the pixel tolerance).
+    The fast pass compares trimmed md5 digests only. When something differs and verify is
+    on, both pages are decoded once so re-encoded art is not counted as a change (a real
+    edit, e.g. a small mosaic patch, stays "changed" thanks to the pixel tolerance).
+    Metadata from an older extraction has no digests, in which case the pages are compared
+    by pixels directly.
     """
     orig_regions = atlas_page_regions(orig_meta)
     mod_regions = atlas_page_regions(mod_meta)
-    stats = atlas_mod.compare_piece_digests(orig_meta.get('digests') or {}, mod_meta.get('digests') or {},
-                                            orig_regions, mod_regions)
-    if stats.changed == 0:
-        return stats
+    stats = atlas_mod.PageStats()
+    have_digests = bool(orig_meta.get('digests')) and bool(mod_meta.get('digests'))
+    if have_digests:
+        stats = atlas_mod.compare_piece_digests(orig_meta.get('digests') or {}, mod_meta.get('digests') or {},
+                                                orig_regions, mod_regions)
+        if stats.changed == 0 or not verify:
+            return stats
     page_a = atlas_mod.load_page_image(orig_meta.get('page_file') or '')
     page_b = atlas_mod.load_page_image(mod_meta.get('page_file') or '')
     if page_a is None or page_b is None:
-        return stats
+        return stats if have_digests else atlas_mod.PageStats()
     return atlas_mod.compare_pages_pixels(page_a, page_b, orig_regions, mod_regions)
 
 
@@ -1004,9 +1011,29 @@ class WorkerThread(QThread):
                                         t['size'] = os.path.getsize(t['save_path'])
                                     else:
                                         t['size'] = 0
-                        self.sig_log.emit(f"Reusing existing {label} extraction ({len(textures)} items).")
-                        self.sig_progress.emit(prog_start + prog_range, f"{label} reuse complete.")
-                        return textures
+                        # An extraction made by an older version may describe per-region items
+                        # or page items without piece digests; the Atlas column would then stay
+                        # empty and the page comparison would have nothing to compare.
+                        if self.args.get('atlas_enabled', True) and isinstance(textures, list):
+                            for t in textures:
+                                if not isinstance(t, dict):
+                                    continue
+                                meta = t.get('atlas') or {}
+                                page = t.get('atlas_page') or {}
+                                if meta.get('region'):
+                                    self.sig_log.emit(f"Stored {label} extraction uses the old per-region layout; re-extracting.")
+                                    textures = None
+                                    break
+                                if page and not page.get('digests'):
+                                    self.sig_log.emit(f"Stored {label} extraction lacks atlas piece data; re-extracting.")
+                                    textures = None
+                                    break
+                        if not textures:
+                            pass
+                        else:
+                            self.sig_log.emit(f"Reusing existing {label} extraction ({len(textures)} items).")
+                            self.sig_progress.emit(prog_start + prog_range, f"{label} reuse complete.")
+                            return textures
             
             # Otherwise, clear and extract
             self.sig_log.emit(f"Extracting textures from {label} assets...")
@@ -1088,25 +1115,49 @@ class WorkerThread(QThread):
         same_res = self.args['same_res']
         filter_enabled = self.args.get('filter_enabled', False)
         sim_cutoff = self.args.get('sim_cutoff', 0.5)
+        # Optional second pass over atlas pages: verified pieces are decoded to tell
+        # "re-encoded" from "edited". Off by default because the trimmed digests already
+        # match exactly for unchanged art (apply always verifies before writing).
+        verify_pages = bool(self.args.get('atlas_pixel_verify', False))
 
         self.sig_log.emit(f"Matching {len(orig_textures)} originals against {len(mod_textures)} modified textures.")
 
-        self.sig_log.emit("Hashing Modified textures...")
-        total_mod = len(mod_textures)
-        for i, tex in enumerate(mod_textures):
-            if 'save_path' not in tex:
-                continue
-            if not os.path.exists(tex['save_path']):
-                continue
-            if 'hash' not in tex:
-                try:
-                    # trim-normalised hash for atlas regions: the packing trim differs
-                    # between builds and would otherwise scatter the candidate ranking
-                    tex['hash'] = get_image_hash(tex['save_path'], trim=bool(atlas_keys(tex)[0]))
-                except: continue
-            if i % 20 == 0:
-                self.sig_progress.emit(int((i/total_mod)*100), f"Hashing Modified {i}/{total_mod}...")
+        def hash_items(items, label):
+            """Hashes the items that have no hash yet, in parallel (decoding dominates)."""
+            todo = [t for t in items
+                    if t.get('save_path') and os.path.exists(t['save_path']) and not t.get('hash')]
+            if not todo:
+                return
+            self.sig_log.emit(f"Hashing {label} textures ({len(todo)})...")
 
+            def work(tex):
+                try:
+                    # legacy per-region items hash their trimmed content; page items and
+                    # plain images hash the whole image so they stay comparable
+                    tex['hash'] = get_image_hash(
+                        tex['save_path'], trim=bool(atlas_keys(tex)[0]) and not tex.get('atlas_page'))
+                except Exception:
+                    tex['hash'] = None
+
+            with ThreadPoolExecutor(max_workers=min(8, len(todo))) as pool:
+                list(pool.map(work, todo))
+
+        hash_items(mod_textures, "Modified")
+        hash_items(orig_textures, "Original")
+
+        # Warm the downscaled cache in parallel: matching then compares 256px copies, which
+        # turns minutes of repeated full-size decodes into seconds.
+        clear_small_cache()
+
+        def warm(items):
+            paths = [t['save_path'] for t in items if t.get('save_path') and os.path.exists(t['save_path'])]
+            if not paths:
+                return
+            with ThreadPoolExecutor(max_workers=min(8, len(paths))) as pool:
+                list(pool.map(load_small, paths))
+
+        warm(mod_textures)
+        warm(orig_textures)
         self.sig_log.emit("Matching textures...")
         results = []
         atlas_summary = {"paired": 0, "same": 0, "moved": 0, "rotated": 0, "resized": 0}
@@ -1126,42 +1177,61 @@ class WorkerThread(QThread):
             # ---- Atlas page items: one row per page, pieces compared internally ----
             if o_page:
                 o_strong, o_weak = atlas_keys(o_tex)
+                plain_pool = []
                 for m_tex in mod_textures:
                     m_page = m_tex.get('atlas_page') or {}
                     m_strong, m_weak = atlas_keys(m_tex)
                     is_identity = bool(o_weak) and o_weak == m_weak and bool(m_page)
-                    # plain page similarity is always computed (also for plain images and
-                    # for atlases whose pieces were renamed), then merged with the atlas
-                    # overlap so an atlas match of 90% outranks a plain match of 50%
-                    plain_sim = compare_images(o_tex['save_path'], m_tex['save_path'], trim=True)
-                    if m_page:
-                        stats = atlas_page_stats(o_page, m_page)
-                        if stats.total <= 0:
-                            continue
-                        atlas_ratio = stats.ratio
-                        text, detail = stats.summary(), stats.detail()
-                        piece_stats = stats.to_dict()
-                        state = "page"
-                    else:
-                        atlas_ratio = None
-                        text, detail, piece_stats, state = "-", "", {}, "none"
+                    if not m_page:
+                        # plain images are still candidates, but only the closest ones are
+                        # compared precisely (a web game can hold hundreds of them)
+                        plain_pool.append(m_tex)
+                        continue
+                    # the atlas overlap is authoritative for pages; the plain page similarity
+                    # is merged in so an atlas match of 90% outranks a plain match of 50%
+                    plain_sim = compare_images_fast(o_tex['save_path'], m_tex['save_path'], trim=True) if is_identity else 0.0
+                    stats = atlas_page_stats(o_page, m_page, verify=verify_pages)
+                    if stats.total <= 0:
+                        continue
                     all_potentials.append({
                         'tex': m_tex,
-                        'similarity': max(plain_sim, atlas_ratio or 0.0),
+                        'similarity': max(plain_sim, stats.ratio),
                         'plain_similarity': plain_sim,
-                        'atlas_ratio': atlas_ratio,
+                        'atlas_ratio': stats.ratio,
                         'is_exact': is_identity,
                         'is_same_res': (m_tex.get('width') == o_tex.get('width')
                                         and m_tex.get('height') == o_tex.get('height')),
-                        'atlas_state': state,
-                        'atlas_text': text,
-                        'atlas_detail': detail,
+                        'atlas_state': "page",
+                        'atlas_text': stats.summary(),
+                        'atlas_detail': stats.detail(),
                         'match_by': "atlas" if is_identity else "sim",
-                        'piece_stats': piece_stats,
+                        'piece_stats': stats.to_dict(),
                     })
+                if plain_pool:
+                    ranked = []
+                    for m_tex in plain_pool:
+                        if o_tex.get('hash') and m_tex.get('hash'):
+                            ranked.append((hamming_similarity(o_tex['hash'], m_tex['hash']), m_tex))
+                    # without hashes (e.g. restored metadata) fall back to the first N
+                    picked = ranked[:num_candidates] if ranked else [(0.0, m) for m in plain_pool[:num_candidates]]
+                    picked.sort(key=lambda x: x[0], reverse=True)
+                    for _, m_tex in picked:
+                        plain_sim = compare_images_fast(o_tex['save_path'], m_tex['save_path'], trim=True)
+                        all_potentials.append({
+                            'tex': m_tex,
+                            'similarity': plain_sim,
+                            'plain_similarity': plain_sim,
+                            'atlas_ratio': None,
+                            'is_exact': False,
+                            'is_same_res': (m_tex.get('width') == o_tex.get('width')
+                                            and m_tex.get('height') == o_tex.get('height')),
+                            'atlas_state': "none",
+                            'atlas_text': "-",
+                            'atlas_detail': "",
+                            'match_by': "sim",
+                            'piece_stats': {},
+                        })
                 identity_hits = [p for p in all_potentials if p['is_exact']]
-                # plain images and re-named atlases stay available as candidates, ordered by
-                # their similarity; identity hits always come first
                 others = sorted((p for p in all_potentials if not p['is_exact']),
                                 key=lambda x: x['similarity'], reverse=True)[:num_candidates]
                 all_potentials = identity_hits + others
@@ -1173,7 +1243,8 @@ class WorkerThread(QThread):
             is_atlas_item = bool(o_atlas_strong)
             
             try:
-                o_tex['hash'] = get_image_hash(o_tex['save_path'], trim=is_atlas_item)
+                if not o_tex.get('hash'):
+                    o_tex['hash'] = get_image_hash(o_tex['save_path'], trim=is_atlas_item and not o_page)
             except Exception as e:
                 self.sig_log.emit(f"Error hashing {o_tex['save_path']}: {e}")
                 continue
@@ -1206,7 +1277,7 @@ class WorkerThread(QThread):
             # Refine all candidates in the pool
             for m_tex in candidate_pool.values():
                 # trim-normalised comparison for atlas regions (see similarity.trim_to_content)
-                refined_sim = compare_images(o_tex['save_path'], m_tex['save_path'], trim=is_atlas_item)
+                refined_sim = compare_images_fast(o_tex['save_path'], m_tex['save_path'], trim=is_atlas_item)
                 m_atlas_strong, m_atlas_weak = atlas_keys(m_tex)
                 is_atlas_pair = bool(o_atlas_strong) and (
                     m_atlas_strong == o_atlas_strong or (bool(o_atlas_weak) and m_atlas_weak == o_atlas_weak)
@@ -1349,7 +1420,8 @@ class WorkerThread(QThread):
             self.sig_log.emit(f"Atlas identity matches: {atlas_summary['paired']} "
                               f"(same {atlas_summary['same']} / moved {atlas_summary['moved']} / "
                               f"rotated {atlas_summary['rotated']} / resized {atlas_summary['resized']})")
-        
+
+        clear_small_cache()
         self.sig_finished.emit(results)
 
 class PreviewWorker(QObject):
@@ -2380,6 +2452,9 @@ class MainWindow(QMainWindow):
 
         if results_to_load:
             self.results = results_to_load
+            if not any(isinstance(r, dict) and r.get('atlas_text') for r in results_to_load):
+                self.log("Restored results were saved by an older version (no atlas info). "
+                         "Run Match again to fill the Atlas column.")
             
             # Restore apk_info if present in metadata, or reconstruct it for APK mode
             if isinstance(loaded_metadata, dict) and "apk_info" in loaded_metadata:
@@ -2692,7 +2767,17 @@ class MainWindow(QMainWindow):
                 item.setText(6, str(p_id))
 
             # Atlas column: packing geometry of the matched region ("-" for plain images)
-            self._apply_atlas_cell(item, res.get('atlas_state'), res.get('atlas_text'), res.get('atlas_detail'),
+            atlas_state = res.get('atlas_state')
+            atlas_text = res.get('atlas_text')
+            atlas_detail = res.get('atlas_detail')
+            page_meta = orig.get('atlas_page') or {}
+            if not atlas_text and page_meta:
+                # an atlas page that has not been matched yet: show the piece count so the
+                # column is never blank for an atlas item
+                atlas_state = "page"
+                atlas_text = f"{page_meta.get('pieces', 0)} pcs"
+                atlas_detail = "Not matched yet - run Match to compute the piece overlap."
+            self._apply_atlas_cell(item, atlas_state, atlas_text, atlas_detail,
                                    ratio=(res.get('piece_stats') or {}).get('ratio'))
 
             # Right-align numeric columns (Original)
