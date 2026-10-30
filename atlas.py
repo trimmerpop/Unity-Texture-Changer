@@ -291,16 +291,95 @@ def pack_region(piece: Image.Image, region: AtlasRegion, resize: bool = True) ->
     return piece
 
 
+def alpha_bbox(image: Image.Image) -> Optional[Tuple[int, int, int, int]]:
+    """Bounds of the visible pixels of a piece (None when fully transparent)."""
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    mask = np.asarray(image)[:, :, 3] > 10
+    if not mask.any():
+        return None
+    rows = np.flatnonzero(mask.any(axis=1))
+    cols = np.flatnonzero(mask.any(axis=0))
+    return int(cols[0]), int(rows[0]), int(cols[-1]) + 1, int(rows[-1]) + 1
+
+
+def align_piece_to_region(piece: Image.Image, source: AtlasRegion,
+                          target: AtlasRegion) -> Image.Image:
+    """Fits a source piece into the target sprite box so the artwork overlaps.
+
+    Both builds trim and pack the same sprite differently: the visible content can be a few
+    pixels wider/shorter and its offset inside the sprite box can differ. Stretching the raw
+    crop to the target rect then smears the art, so:
+      - the resolution follows the ORIGINAL: the content is scaled only by the ratio of the
+        untrimmed sprite sizes (usually 1.0, so no resampling at all),
+      - the content is centred on the target's content, which removes the offset difference
+        and makes the shapes overlap,
+      - everything the art does not cover stays transparent (transparent art stays
+        transparent instead of being filled with a background).
+    Returns an image with the target's packed footprint, ready for pasting.
+    """
+    if piece.mode != "RGBA":
+        piece = piece.convert("RGBA")
+    if target.width <= 0 or target.height <= 0:
+        return pack_region(piece, target)
+
+    # Fast path: both builds describe the sprite identically -> keep the pixels untouched
+    # (no trim/resample at all, so an unchanged piece stays byte identical). A different
+    # rotation is fine: pack_region rotates the piece to the target orientation.
+    if ((source.width, source.height) == (target.width, target.height)
+            and (source.offset_x, source.offset_y) == (target.offset_x, target.offset_y)
+            and (source.orig_width, source.orig_height) == (target.orig_width, target.orig_height)):
+        return pack_region(piece, target)
+
+    bounds = alpha_bbox(piece)
+    art = piece.crop(bounds) if bounds else piece
+
+    scale_x = scale_y = 1.0
+    if source.orig_width > 0 and target.orig_width > 0 and source.orig_height > 0 and target.orig_height > 0:
+        scale_x = target.orig_width / source.orig_width
+        scale_y = target.orig_height / source.orig_height
+    # Guard against nonsense metadata (missing orig sizes, wildly different builds)
+    if not (0.125 <= scale_x <= 8 and 0.125 <= scale_y <= 8):
+        scale_x = scale_y = 1.0
+
+    width = max(1, int(round(art.width * scale_x)))
+    height = max(1, int(round(art.height * scale_y)))
+    if (width, height) != art.size:
+        art = art.resize((width, height), Image.Resampling.LANCZOS)
+    # safety net: when the art ended up far larger than the sprite, fall back to fitting it
+    if width > target.width * 2 or height > target.height * 2:
+        return pack_region(piece, target)
+
+    canvas = Image.new("RGBA", (target.width, target.height), (0, 0, 0, 0))
+    canvas.paste(art, ((target.width - width) // 2, (target.height - height) // 2))
+
+    transform = _PACK_TRANSFORM.get(target.rotate)
+    if transform is not None:
+        canvas = canvas.transpose(transform)
+    if canvas.size != (target.packed_width, target.packed_height):
+        canvas = canvas.resize((target.packed_width, target.packed_height),
+                               Image.Resampling.LANCZOS)
+    return canvas
+
+
 def composite_region(page_image: Image.Image, piece: Image.Image, region: AtlasRegion,
-                     source_premultiplied: bool = False) -> None:
+                     source_premultiplied: bool = False,
+                     source_region: Optional[AtlasRegion] = None) -> None:
     """Writes piece into page_image at the region's original rect (in place).
 
     source_premultiplied tells whether the piece already matches the page's alpha
     convention: region images extracted by this module keep the page pixels as-is
     (so pass True), while plain replacement art is straight alpha and gets
     premultiplied for `pma` pages.
+
+    source_region is the region the piece was taken from. When it is given, the artwork is
+    aligned into the target box (see align_piece_to_region) so a source build with another
+    trim/offset still overlaps the original instead of being stretched.
     """
-    packed = pack_region(piece, region)
+    if source_region is not None:
+        packed = align_piece_to_region(piece, source_region, region)
+    else:
+        packed = pack_region(piece, region)
     if region.pma and not source_premultiplied:
         packed = premultiply_alpha(packed)
     if packed.size != (region.packed_width, region.packed_height):
@@ -376,7 +455,10 @@ def write_page_regions(page_path: str, updates: Sequence[AtlasUpdate],
         for update in updates:
             region, piece = update[0], update[1]
             premultiplied = bool(update[2]) if len(update) > 2 else source_premultiplied
-            composite_region(page_image, piece, region, source_premultiplied=premultiplied)
+            # optional 4th element: the region the piece was taken from (alignment)
+            from_region = update[3] if len(update) > 3 else None
+            composite_region(page_image, piece, region, source_premultiplied=premultiplied,
+                             source_region=from_region)
         page_image.save(tmp_path, format="PNG")
         os.replace(tmp_path, out_path)
         return True

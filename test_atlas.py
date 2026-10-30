@@ -128,6 +128,69 @@ def test_transforms(fixture):
     check("composite identity keeps the page pixel-identical", images_equal(page, copy))
 
 
+def test_piece_alignment(fixture):
+    """align_piece_to_region: original resolution, overlapping shape, transparent padding."""
+    # target sprite: 40x40 content in a 60x60 sprite box (offset 10,10)
+    target = atlas_mod.AtlasRegion(name="arm", page="p.png", x=0, y=0, width=40, height=40,
+                                   offset_x=10, offset_y=10, orig_width=60, orig_height=60)
+
+    # 1) same art as the source -> pixel identical result
+    art = Image.new("RGBA", (40, 40), (200, 60, 60, 255))
+    same_source = atlas_mod.AtlasRegion(name="arm", page="p.png", x=0, y=0, width=40, height=40,
+                                       offset_x=10, offset_y=10, orig_width=60, orig_height=60)
+    aligned = atlas_mod.align_piece_to_region(art, same_source, target)
+    check("align: same region keeps the art pixel-identical", images_equal(aligned, art))
+    check("align: footprint matches the target", aligned.size == (40, 40), aligned.size)
+
+    # 2) the source carries 6px of transparent padding (a different trim)
+    padded = Image.new("RGBA", (52, 52), (0, 0, 0, 0))
+    padded.paste(art, (6, 6))
+    padded_source = atlas_mod.AtlasRegion(name="arm", page="p.png", x=0, y=0, width=52, height=52,
+                                         offset_x=4, offset_y=4, orig_width=60, orig_height=60)
+    aligned_padded = atlas_mod.align_piece_to_region(padded, padded_source, target)
+    bounds = atlas_mod.alpha_bbox(aligned_padded)
+    check("align: padding is trimmed and the content fills the box", bounds == (0, 0, 40, 40), bounds)
+    check("align: padded art is not scaled (no blur)",
+          images_equal(atlas_mod.trim_alpha(aligned_padded), art))
+
+    # 3) the source art is 4px wider (slightly higher resolution)
+    wide = Image.new("RGBA", (44, 40), (200, 60, 60, 255))
+    wide_source = atlas_mod.AtlasRegion(name="arm", page="p.png", x=0, y=0, width=44, height=40,
+                                       offset_x=10, offset_y=10, orig_width=60, orig_height=60)
+    aligned_wide = atlas_mod.align_piece_to_region(wide, wide_source, target)
+    wide_bounds = atlas_mod.alpha_bbox(aligned_wide)
+    check("align: the original box keeps its size", aligned_wide.size == (40, 40), aligned_wide.size)
+    check("align: wider art is centred, not stretched",
+          wide_bounds == (0, 0, 40, 40), wide_bounds)
+
+    # 4) a higher resolution source build (bigger sprite box) is scaled to the original
+    big_art = Image.new("RGBA", (80, 80), (200, 60, 60, 255))
+    big_source = atlas_mod.AtlasRegion(name="arm", page="p.png", x=0, y=0, width=80, height=80,
+                                      offset_x=20, offset_y=20, orig_width=120, orig_height=120)
+    aligned_big = atlas_mod.align_piece_to_region(big_art, big_source, target)
+    check("align: a bigger source sprite follows the original resolution",
+          atlas_mod.alpha_bbox(aligned_big) == (0, 0, 40, 40),
+          atlas_mod.alpha_bbox(aligned_big))
+
+    # 5) rotated target: the packed footprint is respected
+    rotated_target = atlas_mod.AtlasRegion(name="arm", page="p.png", x=0, y=0, width=40, height=20,
+                                          rotate=90, offset_x=10, offset_y=10,
+                                          orig_width=60, orig_height=60)
+    aligned_rot = atlas_mod.align_piece_to_region(art.resize((40, 20)), same_source, rotated_target)
+    check("align: rotated target keeps its packed footprint", aligned_rot.size == (20, 40),
+          aligned_rot.size)
+
+    # 6) transparent surroundings stay transparent (the original background is kept)
+    canvas = Image.new("RGBA", (60, 60), (1, 2, 3, 255))
+    small_art = Image.new("RGBA", (20, 20), (200, 60, 60, 255))
+    small_source = atlas_mod.AtlasRegion(name="arm", page="p.png", x=0, y=0, width=20, height=20,
+                                        offset_x=20, offset_y=20, orig_width=60, orig_height=60)
+    atlas_mod.composite_region(canvas, small_art, target, source_premultiplied=True,
+                               source_region=small_source)
+    corner = canvas.getpixel((0, 0))
+    check("align: uncovered area is transparent, not filled", corner == (0, 0, 0, 0), corner)
+
+
 def test_write_back(fixture):
     page_path = os.path.join(fixture, "page.png")
     parsed = atlas_mod.parse_atlas(os.path.join(fixture, "flat.atlas"))
@@ -383,6 +446,7 @@ def main():
         print("== transforms ==")
         test_transforms(fixture)
         print("== write back ==")
+        test_piece_alignment(fixture)
         test_write_back(fixture)
         print("== trim normalization ==")
         test_trim_normalization(fixture)

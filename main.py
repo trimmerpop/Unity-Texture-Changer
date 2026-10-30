@@ -366,7 +366,8 @@ def assemble_atlas_preview(orig_meta, mod_meta, out_dir, orig_preview_path=None,
             piece = atlas_mod.unpack_region(overlay, twin)
         except Exception:
             continue
-        atlas_mod.composite_region(base, piece, region, source_premultiplied=mod_pma)
+        atlas_mod.composite_region(base, piece, region, source_premultiplied=mod_pma,
+                                   source_region=twin)
 
     try:
         os.makedirs(out_dir, exist_ok=True)
@@ -606,7 +607,7 @@ class WorkerThread(QThread):
                         continue
                 except Exception:
                     pass
-            updates.append((region, piece, mod_pma))
+            updates.append((region, piece, mod_pma, twin))
             digests[key] = digest
         if not updates:
             if orig_meta.get('digests') != digests:
@@ -614,7 +615,13 @@ class WorkerThread(QThread):
             return 0
         if not atlas_mod.write_page_regions(page_path, updates):
             return 0
-        orig_meta['digests'] = digests  # keep the metadata in sync with the page
+        # Store the digests of what is actually on the page now (the aligned art can differ
+        # from the raw source piece by a pixel or two).
+        written_page = atlas_mod.load_page_image(page_path)
+        if written_page is not None:
+            orig_meta['digests'] = atlas_mod.page_piece_digests(written_page, orig_regions)
+        else:
+            orig_meta['digests'] = digests
         return len(updates)
 
     def run_apply(self):
