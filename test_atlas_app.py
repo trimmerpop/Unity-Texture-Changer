@@ -451,6 +451,22 @@ def test_page_mode():
             print(f"  info  yellow pixels: raw mod sheet {raw_diff} -> assembled {asm_diff}")
             check("highlight: assembling removes the re-packing diff noise",
                   asm_diff < raw_diff * 0.5, (raw_diff, asm_diff))
+
+            # ---- highlight OFF: the mod image itself must be compared, no assembly ----
+            window.diff_check.setChecked(False)
+            window.update_comparison_view(target["original"], mod_match)
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                APP.processEvents()
+                current = window.comp_widget.current_img2_path or ""
+                if current == mod_preview:
+                    break
+                time.sleep(0.05)
+            plain_path = window.comp_widget.current_img2_path or ""
+            check("highlight off: the raw mod image is shown",
+                  plain_path == mod_preview, (plain_path, mod_preview))
+            check("highlight off: no assembled page is used",
+                  not plain_path.endswith("__assembled.png"), plain_path)
             window.close()
 
         print("== apply (page mode) ==")

@@ -1599,9 +1599,10 @@ class PreviewWorker(QObject):
         img1 = get_safe_qimage(path1)
         if request_id != self.parent_window.current_preview_id: return
 
-        # Atlas pages: the matched page is packed differently, so show the mod art placed
-        # into the ORIGINAL layout (exactly what Apply would write). The difference
-        # highlight then marks real art changes instead of the whole re-packed sheet.
+        # Atlas pages: only with Highlight Difference on, show the mod art placed into the
+        # ORIGINAL layout (exactly what Apply would write), so the yellow highlight marks the
+        # real art changes instead of the whole re-packed sheet. With the highlight off the
+        # mod page is compared as it is.
         display_path2 = path2
         assembled = False
         if show_diff and path2:
