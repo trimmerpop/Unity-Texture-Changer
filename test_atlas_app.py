@@ -940,6 +940,19 @@ def test_restart_restore():
         remove_tree(root)
 
 
+def test_window_title_version():
+    """The window title must show the app version (see APP_VERSION)."""
+    window = app_main.MainWindow()
+    try:
+        title = window.windowTitle()
+        check("title: shows the app name and version",
+              title == f"Unity Texture Changer v{app_main.APP_VERSION}", title)
+        check("title: version has no empty value",
+              bool(str(app_main.APP_VERSION).strip()) and app_main.APP_VERSION != "0", app_main.APP_VERSION)
+    finally:
+        window.close()
+
+
 def test_thumbnail_viewport_frame():
     """The thumbnail frame must stand out on a grayscale + yellow difference image."""
     from PyQt6.QtGui import QImage, QPixmap
@@ -1135,6 +1148,7 @@ def test_unity_page_items():
 def main():
     test_legacy_region_apply()
     test_assembled_preview_unit()
+    test_window_title_version()
     test_thumbnail_viewport_frame()
     test_unity_page_items()
     test_page_mode()

@@ -27,6 +27,9 @@ import ctypes
 COL_REPLACE, COL_NAME, COL_RES, COL_SIZE, COL_SIM, COL_ATLAS, \
     COL_ASSETS, COL_PATHID, COL_MATCH, COL_MRES, COL_MSIZE = range(11)
 
+# Shown in the window title (see MainWindow) - keep it in sync with the GitHub release tag
+APP_VERSION = "1.03"
+
 
 class SortableTreeWidgetItem(QTreeWidgetItem):
     @staticmethod
@@ -1798,7 +1801,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Unity Texture Changer")
+        self.setWindowTitle(f"Unity Texture Changer v{APP_VERSION}")
         # Determine internal resource path (sys._MEIPASS when frozen)
         if getattr(sys, 'frozen', False):
             # sys._MEIPASS is injected by PyInstaller at runtime only
@@ -1859,6 +1862,7 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.init_ui()
         self.load_settings()
+        self.log(f"Unity Texture Changer v{APP_VERSION}")
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
