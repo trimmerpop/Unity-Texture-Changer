@@ -655,6 +655,158 @@ def extract_atlas_regions(atlas_path: str, out_dir: str, log_callback=None) -> L
     return entries
 
 
+def atlas_piece_layout(atlas: AtlasFile) -> Dict[str, AtlasRegion]:
+    """Maps a stable piece key -> region for a whole atlas (all pages).
+
+    Piece names are unique inside an atlas except a few odd cases, where the page stem is
+    prefixed ("page|name"). The same rule is used for the digests, so build A and build B
+    produce identical keys even when the packer distributed pieces over other pages.
+    """
+    counts = {}
+    for page in atlas.pages:
+        for region in page.regions:
+            counts[region_key(region.name)] = counts.get(region_key(region.name), 0) + 1
+    layout: Dict[str, AtlasRegion] = {}
+    duplicates: Dict[str, int] = {}
+    for page in atlas.pages:
+        stem = os.path.splitext(os.path.basename(page.name))[0]
+        for region in page.regions:
+            name = region_key(region.name)
+            key = name if counts.get(name, 0) == 1 else f"{stem}|{name}"
+            # two sprites with the same name on the same page still need distinct keys
+            if key in layout:
+                duplicates[key] = duplicates.get(key, 1) + 1
+                key = f"{key}#{duplicates[key]}"
+            layout[key] = region
+    return layout
+
+
+def atlas_piece_digests(atlas: AtlasFile, page_images: Dict[str, Image.Image]) -> Dict[str, str]:
+    """Maps piece key -> trimmed md5 for a whole atlas (all pages)."""
+    digests: Dict[str, str] = {}
+    for key, region in atlas_piece_layout(atlas).items():
+        page_image = page_images.get(region.page)
+        if page_image is None:
+            continue
+        try:
+            digests[key] = piece_digest(unpack_region(page_image, region))
+        except Exception:
+            continue
+    return digests
+
+
+def compare_piece_layouts(orig_digests: Dict[str, str], mod_digests: Dict[str, str],
+                          orig_layout: Dict[str, AtlasRegion], mod_layout: Dict[str, AtlasRegion]) -> PageStats:
+    """Fast pass over two whole atlases (all pages) using their piece digests."""
+    stats = PageStats()
+    for key, digest in orig_digests.items():
+        twin = mod_digests.get(key)
+        if twin is None:
+            stats.missing += 1
+            continue
+        stats.pieces += 1
+        if digest == twin:
+            stats.identical += 1
+        else:
+            stats.changed += 1
+        a, b = orig_layout.get(key), mod_layout.get(key)
+        if a and b:
+            if (a.width, a.height) != (b.width, b.height):
+                stats.trimmed += 1
+            elif a.rotate != b.rotate:
+                stats.rotated += 1
+            elif (a.x, a.y) != (b.x, b.y):
+                stats.moved += 1
+    for key in mod_digests:
+        if key not in orig_digests:
+            stats.extra += 1
+    return stats
+
+
+def extract_atlas_item(atlas_path: str, out_dir: str, preview_max: int = 1024,
+                       log_callback=None) -> List[dict]:
+    """One metadata entry per .atlas FILE (all of its pages are one item).
+
+    A multi-page atlas (1p.png, 1p_2.png, ...) is a single character, so it is offered as one
+    item: the pieces of every page are compared together and the page rows never show up as
+    if they were pieces. Apply writes each changed piece back into the page that owns it.
+    """
+    def log(message):
+        if log_callback:
+            log_callback(message)
+
+    try:
+        atlas = parse_atlas(atlas_path)
+    except Exception as error:
+        log(f"  [ATLAS] Failed to parse {os.path.basename(atlas_path)}: {error}")
+        return []
+    if not atlas.pages:
+        return []
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    page_images: Dict[str, Image.Image] = {}
+    pages_meta = []
+    for page in atlas.pages:
+        page_path = atlas.page_path(page)
+        image = load_page_image(page_path)
+        if image is None:
+            log(f"  [ATLAS] Page image missing/unreadable: {page.name}")
+            continue
+        page.width, page.height = image.size
+        page_images[page.name] = image
+        pages_meta.append({
+            "page": page.name,
+            "file": os.path.abspath(page_path),
+            "size": [page.width, page.height],
+            "pieces": len(page.regions),
+        })
+    if not page_images:
+        return []
+
+    digests = atlas_piece_digests(atlas, page_images)
+    first_page = next((p for p in atlas.pages if p.name in page_images), atlas.pages[0])
+    first_image = page_images[first_page.name]
+
+    preview = first_image
+    if max(preview.size) > preview_max:
+        preview = preview.copy()
+        preview.thumbnail((preview_max, preview_max), Image.Resampling.BOX)
+    stem = os.path.splitext(os.path.basename(atlas_path))[0]
+    safe = re.sub(r'[\\/:*?"<>|]', "_", stem).strip() or "atlas"
+    file_name = f"{safe}.png"
+    save_path = os.path.join(out_dir, file_name)
+    try:
+        preview.save(save_path, format="PNG")
+    except Exception as error:
+        log(f"  [ATLAS] Could not write preview for {stem}: {error}")
+        return []
+
+    first_page_path = os.path.abspath(atlas.page_path(first_page))
+    entry = {
+        "name": stem,
+        "file": file_name,
+        "save_path": save_path,
+        "width": first_page.width,
+        "height": first_page.height,
+        "size": os.path.getsize(first_page_path) if os.path.exists(first_page_path) else os.path.getsize(save_path),
+        "source_asset": atlas_path,
+        "atlas_item": {
+            "kind": "atlas",
+            "atlas_file": atlas_path,
+            "page_file": first_page_path,
+            "pages": pages_meta,
+            "pieces": len(digests),
+            "pma": first_page.pma,
+            "scale": first_page.scale,
+            "digests": digests,
+        },
+    }
+    log(f"  [ATLAS] {os.path.basename(atlas_path)}: {len(pages_meta)} page(s), "
+        f"{len(digests)} pieces -> 1 item")
+    return [entry]
+
+
 def extract_atlas_pages(atlas_path: str, out_dir: str, preview_max: int = 1024,
                         log_callback=None, used_names: Optional[set] = None) -> List[dict]:
     """One metadata entry per atlas page (no per-piece files).
