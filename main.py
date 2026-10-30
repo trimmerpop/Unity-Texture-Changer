@@ -289,6 +289,92 @@ def atlas_page_label(meta):
     return f"{position}({page_name}) of {atlas_name}" if atlas_name else f"{position}({page_name})"
 
 
+def assemble_atlas_preview(orig_meta, mod_meta, out_dir, orig_preview_path=None,
+                           preview_max=1024):
+    """Builds the mod art inside the ORIGINAL page layout (what Apply would write).
+
+    Two builds pack the same atlas differently, so comparing the two page sheets directly
+    highlights the whole page. This composites every changed piece of the matched page into
+    the original rects (identical pieces keep the original pixels, exactly like the apply
+    step) and returns the path of a temporary PNG, so the mod side is shown assembled to the
+    original and the difference highlight only marks real art changes.
+
+    The PNG is written at preview scale (preview_max) to keep the temp folder small: the
+    original preview it is compared with is downscaled the same way. Returns None when the
+    pages cannot be used.
+    """
+    orig_page_path = orig_meta.get('page_file') or ''
+    mod_page_path = mod_meta.get('page_file') or ''
+    if not orig_page_path or not mod_page_path:
+        return None
+    if not (os.path.exists(orig_page_path) and os.path.exists(mod_page_path)):
+        return None
+    orig_regions = atlas_page_regions(orig_meta)
+    mod_regions = atlas_page_regions(mod_meta)
+    if not orig_regions or not mod_regions:
+        return None
+
+    stem = os.path.splitext(os.path.basename(orig_page_path))[0]
+    out_path = os.path.join(out_dir, f"{stem}__assembled.png")
+    try:
+        # reuse the previous assembly while neither page changed (selection is frequent)
+        if os.path.exists(out_path):
+            stamp = os.path.getmtime(out_path)
+            if (stamp >= os.path.getmtime(orig_page_path)
+                    and stamp >= os.path.getmtime(mod_page_path)):
+                return out_path
+    except OSError:
+        pass
+
+    base = atlas_mod.load_page_image(orig_page_path)
+    overlay = atlas_mod.load_page_image(mod_page_path)
+    if base is None or overlay is None:
+        return None
+
+    orig_digests = orig_meta.get('digests') or {}
+    mod_digests = mod_meta.get('digests') or {}
+    changed = sum(1 for key, digest in orig_digests.items()
+                  if mod_digests.get(key) is not None and mod_digests[key] != digest)
+    if not changed:
+        # Nothing to change: the assembled result IS the original page, so show that instead
+        # of the re-packed mod sheet (no misleading diff noise on an unchanged page).
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            if orig_preview_path and os.path.exists(orig_preview_path):
+                shutil.copy2(orig_preview_path, out_path)
+            else:
+                preview = base.copy()
+                if max(preview.size) > preview_max:
+                    preview.thumbnail((preview_max, preview_max), Image.Resampling.BOX)
+                preview.save(out_path, format="PNG")
+            return out_path
+        except Exception:
+            return None
+
+    mod_by = dict(zip(atlas_mod.piece_keys(mod_regions), mod_regions))
+    mod_pma = bool(mod_meta.get('pma'))
+    for key, region in zip(atlas_mod.piece_keys(orig_regions), orig_regions):
+        twin = mod_by.get(key)
+        if twin is None:
+            continue
+        if orig_digests.get(key) and orig_digests.get(key) == mod_digests.get(key):
+            continue  # identical piece -> the original pixels already are the result
+        try:
+            piece = atlas_mod.unpack_region(overlay, twin)
+        except Exception:
+            continue
+        atlas_mod.composite_region(base, piece, region, source_premultiplied=mod_pma)
+
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        if max(base.size) > preview_max:
+            base.thumbnail((preview_max, preview_max), Image.Resampling.BOX)
+        base.save(out_path, format="PNG")
+        return out_path
+    except Exception:
+        return None
+
+
 _ATLAS_REGION_CACHE = {}
 
 
@@ -1469,7 +1555,7 @@ class PreviewWorker(QObject):
                     self.sig_preview_ready.emit({
                         "request_id": request_id, "img1": None, "img2": None,
                         "thumb_img": None, "main_diff_img": None,
-                        "path1": path1, "path2": path2,
+                        "path1": path1, "path2": path2, "assembled": False,
                     })
             except Exception:
                 pass
@@ -1513,14 +1599,30 @@ class PreviewWorker(QObject):
         img1 = get_safe_qimage(path1)
         if request_id != self.parent_window.current_preview_id: return
 
+        # Atlas pages: the matched page is packed differently, so show the mod art placed
+        # into the ORIGINAL layout (exactly what Apply would write). The difference
+        # highlight then marks real art changes instead of the whole re-packed sheet.
+        display_path2 = path2
+        assembled = False
+        if show_diff and path2:
+            ctx = getattr(self.parent_window, "_atlas_preview", None) or {}
+            if ctx.get("orig") and ctx.get("mod"):
+                out_dir = os.path.join(self.parent_window.temp_dir_orig, "assembled")
+                built = assemble_atlas_preview(ctx["orig"], ctx["mod"], out_dir,
+                                               orig_preview_path=path1)
+                if built:
+                    display_path2 = built
+                    assembled = True
+            if request_id != self.parent_window.current_preview_id: return
+
         # Load Comparison
-        img2 = get_safe_qimage(path2)
+        img2 = get_safe_qimage(display_path2)
         if request_id != self.parent_window.current_preview_id: return
 
         # Generate Diff Thumbnail (Small but slow)
         thumb_img = None
-        if path1 and path2:
-            diff_img = get_difference_mask(path1, path2, grayscale_bg=True)
+        if path1 and display_path2:
+            diff_img = get_difference_mask(path1, display_path2, grayscale_bg=True)
             if diff_img is not None:
                 try:
                     # Encode to PNG for a stable memory handoff to the GUI thread
@@ -1535,8 +1637,8 @@ class PreviewWorker(QObject):
 
         # Generate Main Diff if needed
         main_diff_img_obj = None
-        if show_diff and path1 and path2:
-            main_diff_img = get_difference_mask(path1, path2, grayscale_bg=False)
+        if show_diff and path1 and display_path2:
+            main_diff_img = get_difference_mask(path1, display_path2, grayscale_bg=False)
             if main_diff_img is not None:
                 try:
                     success, buffer = cv2.imencode('.png', main_diff_img)
@@ -1557,7 +1659,8 @@ class PreviewWorker(QObject):
                 "thumb_img": thumb_img,
                 "main_diff_img": main_diff_img_obj,
                 "path1": path1,
-                "path2": path2
+                "path2": display_path2,
+                "assembled": assembled,
             })
 
 class MainWindow(QMainWindow):
@@ -1615,6 +1718,10 @@ class MainWindow(QMainWindow):
         self.current_orig_img = None
         self.current_pix = None
         self.last_viewport = (0, 0, 1, 1)
+        # atlas page metadata of the current selection (set by update_comparison_view) and
+        # the last assembled preview we told the user about
+        self._atlas_preview = None
+        self._last_assembled_path = None
         self.worker_thread = None
         self._is_deleting = False
         self._pending_path_change = False
@@ -3514,6 +3621,11 @@ class MainWindow(QMainWindow):
         img2 = data['img2']
         thumb_img = data['thumb_img']
         main_diff_img = data['main_diff_img']
+
+        if data.get('assembled') and path2 and path2 != self._last_assembled_path:
+            self._last_assembled_path = path2
+            self.log("Atlas preview: mod art assembled into the original page layout "
+                     "(same result Apply would write).")
         
         # Convert QImages to QPixmaps on GUI thread
         pix1 = QPixmap.fromImage(img1) if img1 else QPixmap()
@@ -3577,6 +3689,18 @@ class MainWindow(QMainWindow):
         path2 = match_tex['save_path'] if match_tex else None
         if not path2:
             self.log(f"No match selected for {orig_tex.get('name', '?')} - the right panel stays empty.")
+
+        # Atlas pages are packed differently in both builds: with Highlight Difference on,
+        # the right panel shows the mod art assembled into the ORIGINAL layout instead of
+        # the re-packed sheet, so the yellow highlight marks the real art changes.
+        self._atlas_preview = None
+        orig_page = orig_tex.get('atlas_page') or {}
+        mod_page = (match_tex or {}).get('atlas_page') or {}
+        if orig_page and mod_page:
+            same_atlas = (os.path.basename(orig_page.get('atlas_file') or '').lower()
+                          == os.path.basename(mod_page.get('atlas_file') or '').lower())
+            if same_atlas:
+                self._atlas_preview = {"orig": orig_page, "mod": mod_page}
         
         # Viewport preservation: Don't reset if we want to maintain zoom/scroll across items
         # if path1 != self.comp_widget.current_img1_path or path2 != self.comp_widget.current_img2_path:

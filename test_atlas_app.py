@@ -188,6 +188,95 @@ def remove_tree(root):
         time.sleep(0.2)
 
 
+def make_small_atlas(root, side, colors):
+    """Builds a tiny atlas page (2 pieces) so the assembly can be checked per pixel."""
+    folder = os.path.join(root, side)
+    os.makedirs(folder, exist_ok=True)
+    page = Image.new("RGBA", (200, 100), (0, 0, 0, 0))
+    piece_a = Image.new("RGBA", (40, 40), colors["a"])
+    piece_b = Image.new("RGBA", (60, 20), colors["b"])
+    page.paste(piece_a, (0, 0))
+    page.paste(piece_b, (40, 0))
+    page_path = os.path.join(folder, "small.png")
+    page.save(page_path, format="PNG")
+    atlas_path = os.path.join(folder, "small.atlas")
+    with open(atlas_path, "w", encoding="utf-8") as handle:
+        handle.write("small.png\n"
+                     "size:200,100\n"
+                     "filter:Nearest,Nearest\n"
+                     "pma:false\n"
+                     "scale:1\n"
+                     "piece_a\n"
+                     "bounds:0,0,40,40\n"
+                     "piece_b\n"
+                     "bounds:40,0,60,20\n")
+    parsed = atlas_mod.parse_atlas(atlas_path)
+    page_image = atlas_mod.load_page_image(page_path)
+    digests = {}
+    if page_image is not None:
+        digests = atlas_mod.page_piece_digests(page_image, parsed.pages[0].regions)
+    meta = {
+        "kind": "atlas-page",
+        "atlas_file": atlas_path,
+        "page_file": page_path,
+        "pieces": len(digests),
+        "pma": False,
+        "digests": digests,
+    }
+    return meta
+
+
+def test_assembled_preview_unit():
+    """The assembled preview = original page with only the changed pieces replaced."""
+    root = tempfile.mkdtemp(prefix="atlas_asm_", dir=os.path.dirname(PROJECT))
+    try:
+        red, blue, green = (220, 30, 30, 255), (30, 30, 220, 255), (30, 200, 30, 255)
+        orig_meta = make_small_atlas(root, "orig", {"a": red, "b": green})
+        mod_meta = make_small_atlas(root, "mod", {"a": blue, "b": green})
+
+        out_dir = os.path.join(root, "assembled")
+        before = atlas_mod.load_page_image(orig_meta["page_file"])
+        assembled_path = app_main.assemble_atlas_preview(orig_meta, mod_meta, out_dir)
+        check("assembly: preview file written", bool(assembled_path) and os.path.exists(assembled_path),
+              assembled_path)
+        if not assembled_path:
+            return
+        assembled = atlas_mod.load_page_image(assembled_path)
+        check("assembly: page size kept",
+              assembled is not None and before is not None and assembled.size == before.size,
+              None if assembled is None else assembled.size)
+        if assembled is None:
+            return
+
+        orig_regions = app_main.atlas_page_regions(orig_meta)
+        mod_regions = app_main.atlas_page_regions(mod_meta)
+        mod_by = dict(zip(atlas_mod.piece_keys(mod_regions), mod_regions))
+        by_key = dict(zip(atlas_mod.piece_keys(orig_regions), orig_regions))
+        mod_page = atlas_mod.load_page_image(mod_meta["page_file"])
+        changed_piece = atlas_mod.unpack_region(assembled, by_key["piece_a"])
+        same_piece = atlas_mod.unpack_region(assembled, by_key["piece_b"])
+        check("assembly: changed piece carries the mod art",
+              mod_page is not None
+              and images_equal(changed_piece, atlas_mod.unpack_region(mod_page, mod_by["piece_a"])))
+        check("assembly: unchanged piece keeps the original pixels",
+              images_equal(same_piece, Image.new("RGBA", (60, 20), green)))
+        check("assembly: cache is reused while nothing changed",
+              app_main.assemble_atlas_preview(orig_meta, mod_meta, out_dir) == assembled_path)
+
+        # a page where nothing changed shows the original preview (no diff noise)
+        same_meta = make_small_atlas(root, "same", {"a": red, "b": green})
+        same_meta["page_file"] = os.path.join(root, "same", "small.png")
+        preview = os.path.join(root, "same", "small_preview.png")
+        Image.open(same_meta["page_file"]).resize((100, 50)).save(preview, format="PNG")
+        unmoved = app_main.assemble_atlas_preview(orig_meta, same_meta, out_dir,
+                                                 orig_preview_path=preview)
+        check("assembly: an unchanged page reuses the original preview",
+              bool(unmoved) and images_equal(atlas_mod.load_page_image(unmoved),
+                                             atlas_mod.load_page_image(preview)), unmoved)
+    finally:
+        remove_tree(root)
+
+
 def test_page_mode():
     """Page level mode: 1 item per atlas page, similarity = same pieces / all pieces."""
     root = tempfile.mkdtemp(prefix="atlas_pages_", dir=os.path.dirname(PROJECT))
@@ -303,6 +392,66 @@ def test_page_mode():
             print(f"  info  hina_cg4_2.png: {stats} -> expected {expected:.4f}")
             check("page: ratio == same pieces / total pieces",
                   abs((cg42.get("atlas_ratio") or 0) - expected) < 1e-6, (cg42.get("atlas_ratio"), expected))
+
+        print("== highlight difference: assembled atlas preview ==")
+        # hina_cg1_2 really differs, so the preview must show the mod art inside the ORIGINAL
+        # layout instead of the re-packed mod sheet (that is what Apply writes). Pick a page
+        # that was also re-packed, otherwise both comparisons look the same.
+        def repacked(result):
+            stats = result.get("piece_stats") or {}
+            return stats.get("changed", 0) and (stats.get("moved", 0) or stats.get("rotated", 0))
+
+        target = next((r for r in results if repacked(r)), cg12 or results[0])
+        print(f"  info  assembled preview target: {target['original']['name']}")
+        mod_match = next((t for t in mod_items
+                          if t["save_path"] == target.get("match_file")), None)
+        if mod_match is None:
+            check("highlight: matched mod page found", False, target.get("match_file"))
+        else:
+            window = app_main.MainWindow()
+            window.temp_dir_orig = temp_orig
+            window.temp_dir_mod = temp_mod
+            window.diff_check.setChecked(True)
+            window.update_comparison_view(target["original"], mod_match)
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                APP.processEvents()
+                current = window.comp_widget.current_img2_path or ""
+                if current.endswith("__assembled.png"):
+                    break
+                time.sleep(0.05)
+            assembled_path = window.comp_widget.current_img2_path or ""
+            check("highlight: atlas preview shows the assembled page",
+                  assembled_path.endswith("__assembled.png"), assembled_path)
+            check("highlight: assembled file exists", os.path.exists(assembled_path), assembled_path)
+
+            orig_preview = target["original"]["save_path"]
+            mod_preview = mod_match["save_path"]
+            assembled = Image.open(assembled_path) if os.path.exists(assembled_path) else None
+            with Image.open(orig_preview) as handle:
+                preview_size = handle.size
+            check("highlight: assembled page uses the preview scale",
+                  assembled is not None and max(assembled.size) <= 1024,
+                  None if assembled is None else assembled.size)
+            check("highlight: assembled page matches the original preview scale",
+                  assembled is not None and assembled.size == preview_size,
+                  (None if assembled is None else assembled.size, preview_size))
+
+            from similarity import get_difference_mask
+            import numpy as np
+
+            def yellow_pixels(image):
+                if image is None:
+                    return 0
+                return int(np.count_nonzero((image[:, :, 0] == 0) & (image[:, :, 1] == 255)
+                                            & (image[:, :, 2] == 255)))
+
+            raw_diff = yellow_pixels(get_difference_mask(orig_preview, mod_preview, grayscale_bg=True))
+            asm_diff = yellow_pixels(get_difference_mask(orig_preview, assembled_path, grayscale_bg=True))
+            print(f"  info  yellow pixels: raw mod sheet {raw_diff} -> assembled {asm_diff}")
+            check("highlight: assembling removes the re-packing diff noise",
+                  asm_diff < raw_diff * 0.5, (raw_diff, asm_diff))
+            window.close()
 
         print("== apply (page mode) ==")
         to_replace = [r for r in results if r.get("match_file")][:3]
@@ -713,6 +862,7 @@ def test_restart_restore():
 
 def main():
     test_legacy_region_apply()
+    test_assembled_preview_unit()
     test_page_mode()
     test_atlas_disabled()
     test_stale_metadata()
