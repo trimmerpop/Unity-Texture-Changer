@@ -952,6 +952,79 @@ class WorkerThread(QThread):
         self.sig_progress.emit(100, "Apply complete.")
         self.sig_finished.emit({"success": count, "total": total, "successful_paths": [r['original']['save_path'] for r in to_replace]})
 
+    @staticmethod
+    def _write_assembled_page(orig_meta, mod_meta, dst_path, mod_pma=False):
+        """Writes the assembled page (mod pieces inside the original layout) to dst_path.
+
+        Used by Copy to, which must export the real page resolution instead of the small
+        preview PNG an atlas page item carries. Returns True when dst_path was written.
+        """
+        page_path = orig_meta.get('page_file') or ''
+        orig_regions = atlas_page_regions(orig_meta)
+        mod_regions = atlas_page_regions(mod_meta)
+        if not page_path or not os.path.exists(page_path):
+            return False
+        if not orig_regions or not mod_regions:
+            shutil.copy2(page_path, dst_path)
+            return True
+        mod_image = atlas_mod.load_page_image(mod_meta.get('page_file') or '')
+        if mod_image is None:
+            return False
+        orig_image = atlas_mod.load_page_image(page_path)
+        digests = orig_meta.get('digests') or {}
+        pma = bool(mod_meta.get('pma')) or bool(mod_pma)
+        mod_by = dict(zip(atlas_mod.piece_keys(mod_regions), mod_regions))
+        updates = []
+        for key, region in zip(atlas_mod.piece_keys(orig_regions), orig_regions):
+            twin = mod_by.get(key)
+            if twin is None:
+                continue
+            try:
+                piece = atlas_mod.unpack_region(mod_image, twin)
+            except Exception:
+                continue
+            if digests.get(key) == atlas_mod.piece_digest(piece):
+                continue  # identical piece -> the original pixels already are the result
+            if orig_image is not None:
+                try:
+                    if atlas_mod.pieces_near_identical(
+                            atlas_mod.unpack_region(orig_image, region), piece):
+                        continue
+                except Exception:
+                    pass
+            updates.append((region, piece, pma, twin))
+        if not updates:
+            # nothing to change: export the original page untouched (full resolution)
+            shutil.copy2(page_path, dst_path)
+            return True
+        return atlas_mod.write_page_regions(page_path, updates, out_path=dst_path)
+
+    @classmethod
+    def _export_atlas_page(cls, res, dst_path):
+        """Exports an assembled atlas page to dst_path (any supported image extension)."""
+        orig_meta = res['original'].get('atlas_page') or {}
+        mod_meta = res.get('match_page_meta') or {}
+        dst_ext = os.path.splitext(dst_path)[1].lower()
+        tmp_path = dst_path if dst_ext == ".png" else dst_path + ".png"
+        if not cls._write_assembled_page(orig_meta, mod_meta, tmp_path,
+                                         bool(res.get('match_page_pma'))):
+            if tmp_path != dst_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            return False
+        if tmp_path == dst_path:
+            return True
+        try:
+            ok = convert_image_format(tmp_path, dst_path)
+        finally:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+        return ok
+
     def run_copy(self):
         to_replace = self.args['to_replace']
         target_dir = self.args['target_dir']
@@ -983,8 +1056,19 @@ class WorkerThread(QThread):
                 
             dst = os.path.join(target_dir, dst_name)
             self.sig_progress.emit(int((i/total)*100), f"Copying {i+1}/{total}: {dst_name}")
-            
+
             try:
+                # atlas pages must be exported at the real page resolution (the item itself
+                # only holds a downscaled preview) and in the ORIGINAL layout
+                if orig.get('atlas_page'):
+                    if self._export_atlas_page(res, dst):
+                        count += 1
+                        self.sig_log.emit(f"Atlas page exported: {dst_name} "
+                                          f"(assembled, original resolution)")
+                    else:
+                        self.sig_log.emit(f"WARNING: Could not export the atlas page "
+                                          f"{orig.get('name')}. Skipping {dst_name}.")
+                    continue
                 if ext.lower() != src_ext.lower():
                     if convert_image_format(src, dst):
                         self.sig_log.emit(f"Converted {os.path.basename(src)} -> {ext} ({dst_name})")

@@ -493,6 +493,46 @@ def test_page_mode():
                   not plain_path.endswith("__assembled.png"), plain_path)
             window.close()
 
+        print("== copy to (atlas pages) ==")
+        copy_target = ten or results[0]
+        copy_dir = os.path.join(root, "copy_out")
+        os.makedirs(copy_dir, exist_ok=True)
+        data, error = run_worker("copy", "run_copy", to_replace=[copy_target],
+                                 target_dir=copy_dir, save_as_original=True)
+        check("copy: finished without error", error is None, error)
+        check("copy: one file exported", bool(data and data.get("success")), data)
+        exported = os.path.join(copy_dir, copy_target["original"]["name"] + ".png")
+        check("copy: exported file exists", os.path.exists(exported), exported)
+        if os.path.exists(exported):
+            with Image.open(exported) as handle:
+                exported_size = handle.size
+            page_path = copy_target["original"]["atlas_page"]["page_file"]
+            with Image.open(page_path) as handle:
+                page_size = handle.size
+            print(f"  info  exported {exported_size}, page file {page_size}")
+            check("copy: full page resolution, not the thumbnail",
+                  exported_size == page_size, (exported_size, page_size))
+            mod_meta = copy_target.get("match_page_meta") or {}
+            exported_image = atlas_mod.load_page_image(exported)
+            regions = app_main.atlas_page_regions(copy_target["original"]["atlas_page"])
+            orig_digests = (copy_target["original"]["atlas_page"] or {}).get("digests") or {}
+            mod_digests = mod_meta.get("digests") or {}
+            exported_digests = (atlas_mod.page_piece_digests(exported_image, regions)
+                                if exported_image is not None else {})
+            changed = [key for key, digest in orig_digests.items()
+                       if mod_digests.get(key) and mod_digests[key] != digest]
+            applied = [key for key in changed if exported_digests.get(key) == mod_digests.get(key)]
+            trimmed = int((copy_target.get("piece_stats") or {}).get("trimmed") or 0)
+            print(f"  info  copy: {len(applied)}/{len(changed)} changed pieces carry the mod art "
+                  f"({trimmed} re-trimmed pieces are aligned instead)")
+            check("copy: changed pieces carry the mod art",
+                  bool(applied) and len(applied) >= len(changed) - trimmed,
+                  (len(applied), len(changed), trimmed))
+            unchanged = [key for key in orig_digests if key not in changed]
+            kept = [key for key in unchanged if exported_digests.get(key) == orig_digests.get(key)]
+            check("copy: unchanged pieces keep the original pixels",
+                  len(kept) == len(unchanged), (len(kept), len(unchanged)))
+
         print("== apply (page mode) ==")
         to_replace = [r for r in results if r.get("match_file")][:3]
         before = {r["original"]["atlas_page"]["page_file"]:
@@ -1046,6 +1086,30 @@ def test_unity_page_items():
                   images_equal(changed, Image.new("RGBA", (40, 40), blue)))
             check("unity: assembled page keeps the unchanged piece",
                   images_equal(kept, Image.new("RGBA", (60, 20), green)))
+
+        # copy to: the exported page must keep the texture resolution (the item itself is
+        # the extracted texture here, so this guards against a preview being exported)
+        copy_dir = os.path.join(root, "copy_out")
+        os.makedirs(copy_dir, exist_ok=True)
+        data, error = run_worker("copy", "run_copy", to_replace=[res],
+                                 target_dir=copy_dir, save_as_original=True)
+        check("unity: copy finished without error", error is None, error)
+        check("unity: copy exported a file", bool(data and data.get("success")), data)
+        exported = os.path.join(copy_dir, "atlas_page.png")
+        if os.path.exists(exported):
+            with Image.open(exported) as handle:
+                exported_size = handle.size
+            check("unity: copy keeps the page resolution",
+                  exported_size == (orig["width"], orig["height"]), exported_size)
+            exported_image = atlas_mod.load_page_image(exported)
+            regions = app_main.atlas_page_regions(orig["atlas_page"])
+            if exported_image is not None:
+                piece = atlas_mod.unpack_region(
+                    exported_image, next(r for r in regions if r.name == "piece_a"))
+                check("unity: exported page contains the mod piece",
+                      images_equal(piece, Image.new("RGBA", (40, 40), blue)))
+        else:
+            check("unity: exported file exists", False, exported)
 
         # apply: the page is composited in place, then queued as a texture replacement
         data, error = run_worker("apply", "run_apply", to_replace=[res],

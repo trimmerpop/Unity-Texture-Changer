@@ -89,6 +89,8 @@ How it behaves:
   differently or shifted its offset, the art is scaled by the ratio of the untrimmed sprite
   sizes (usually 1.0, so no resampling), centered on the original piece, and the rest of the
   region stays transparent - transparent art stays transparent.
+- **Copy to**: for an atlas page the exported file is the **assembled page at the original
+  resolution** (the item itself only holds a small preview), so the image can be used directly.
 - **Highlight Difference**: with the toggle on, the right panel shows the mod art **assembled
   into the original layout** (exactly what Apply would write), so the yellow marks only real
   art changes instead of the whole re-packed sheet. With the toggle off the raw modified page
