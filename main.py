@@ -2528,17 +2528,23 @@ class MainWindow(QMainWindow):
             # Populate orig_textures and mod_textures from results/disk for consistency
             if self.results and not getattr(self, 'orig_textures', None):
                 self.orig_textures = [res['original'] for res in self.results]
+            # repaired previews for the restored originals (temp may have been cleared)
+            if self.orig_textures:
+                try:
+                    self._normalize_textures(self.orig_textures, self.temp_dir_orig)
+                except Exception as error:
+                    self.log(f"Preview repair failed: {error}")
             
             if not getattr(self, 'mod_textures', None) and self.mod_path.text():
                 am = self.get_asset_manager()
                 raw_mod = am.load_metadata(self.temp_dir_mod)
                 if raw_mod:
                     if isinstance(raw_mod, dict):
-                        # Handle new dict format (check for results or list)
-                        self.mod_textures = raw_mod.get('results', [])
-                        if not self.mod_textures and isinstance(raw_mod, list): # Fallback
-                             self.mod_textures = raw_mod
-                    else:
+                        if isinstance(raw_mod.get('textures'), list):
+                            self.mod_textures = raw_mod['textures']
+                        else:
+                            self.mod_textures = raw_mod.get('results', [])
+                    elif isinstance(raw_mod, list):
                         self.mod_textures = raw_mod
                     
                     if self.mod_textures:
@@ -2575,10 +2581,13 @@ class MainWindow(QMainWindow):
         am.save_metadata(metadata, self.temp_dir_orig)
         
         # 2. Sync Modified Textures (mod_textures pool and hashes)
-        # This prevents re-hashing thousands of mod images on next restart or update
+        # The folder is stored next to the list, so a restart can tell whether the cached
+        # previews still belong to the selected folder.
         if getattr(self, 'mod_textures', None) and self.temp_dir_mod:
-            # We save the full mod_textures list which now includes 'hash' fields
-            am.save_metadata(self.mod_textures, self.temp_dir_mod)
+            am.save_metadata({
+                "mod_path": self.mod_path.text(),
+                "textures": self.mod_textures,
+            }, self.temp_dir_mod)
             
         self.log("Synchronized matching results and texture hashes to metadata.json.")
 
@@ -2623,11 +2632,14 @@ class MainWindow(QMainWindow):
             raw_data = am.load_metadata(self.temp_dir_mod) or []
             
             if isinstance(raw_data, dict):
-                results = raw_data.get('results', [])
-                if results and isinstance(results, list) and 'original' in results[0]:
-                    self.mod_textures = [r['original'] for r in results]
+                if isinstance(raw_data.get('textures'), list):
+                    self.mod_textures = raw_data['textures']
                 else:
-                    self.mod_textures = results
+                    results = raw_data.get('results', [])
+                    if results and isinstance(results, list) and 'original' in results[0]:
+                        self.mod_textures = [r['original'] for r in results]
+                    else:
+                        self.mod_textures = results
             elif isinstance(raw_data, list) and len(raw_data) > 0:
                 if isinstance(raw_data[0], dict) and 'original' in raw_data[0]:
                     self.mod_textures = [r['original'] for r in raw_data]
@@ -2640,6 +2652,11 @@ class MainWindow(QMainWindow):
                     apk_dir = os.path.join(self.temp_dir_mod, "apk_contents")
                     if os.path.exists(apk_dir): mod_path = apk_dir
                 self.mod_textures = self.scan_image_folder(mod_path, self.temp_dir_mod)
+
+            # remember the folder so a restart keeps these previews
+            settings = QSettings("config.ini", QSettings.Format.IniFormat)
+            settings.setValue("last_extract/modified", self.mod_path.text())
+            settings.sync()
             
         if not self.orig_textures or not self.mod_textures:
             msg = "Extraction metadata missing. Please Extract first."
@@ -3649,35 +3666,53 @@ class MainWindow(QMainWindow):
             self.update_copy_button_state()
 
     def is_extracted(self, path, temp_path):
-        """Checks if a folder is already successfully extracted for the given path."""
+        """Checks if a folder is already extracted for the given path.
+
+        The metadata content is preferred over the recorded "last_extract" setting: a
+        mismatch there used to wipe the temp folder (and every preview with it) whenever the
+        user pressed Match without running Extract first.
+        """
         if not path or not os.path.exists(path):
             return False
-            
-        # Compare with the last successfully extracted path from config.ini
-        settings = QSettings("config.ini", QSettings.Format.IniFormat)
-        label = "original" if temp_path == self.temp_dir_orig else "modified"
-        last_path = settings.value(f"last_extract/{label}", "")
-        
-        if not last_path:
+        if not os.path.exists(temp_path) or not os.listdir(temp_path):
+            return False
+        metadata_path = os.path.join(temp_path, "metadata.json")
+        if not os.path.exists(metadata_path):
             return False
 
-        # APK Mode logic: In APK mode, the UI path might be a folder containing the APK, 
-        # but 'last_path' in config.ini is the path to the APK file itself.
+        # APK Mode logic: in APK mode the UI path may be a folder containing the APK
         compare_path = path
         if self.mode_combo.currentText() == "Unity APK":
             apk_path = self.detect_apk(path)
             if apk_path:
                 compare_path = apk_path
-        
-        # Normalize for accurate comparison (Windows case-insensitivity)
-        if os.path.normcase(os.path.normpath(last_path)) != os.path.normcase(os.path.normpath(compare_path)):
-            return False
-            
-        if not os.path.exists(temp_path) or not os.listdir(temp_path):
-            return False
-            
-        metadata_path = os.path.join(temp_path, "metadata.json")
-        return os.path.exists(metadata_path)
+        compare_norm = os.path.normcase(os.path.normpath(compare_path))
+
+        def same(recorded):
+            if not recorded:
+                return False
+            try:
+                return os.path.normcase(os.path.normpath(str(recorded))) == compare_norm
+            except (TypeError, ValueError):
+                return False
+
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception:
+            data = None
+
+        if isinstance(data, dict):
+            if same(data.get("orig_path")) or same(data.get("mod_path")):
+                return True
+            if isinstance(data.get("textures"), list):
+                return False  # textures were produced from another folder
+        elif isinstance(data, list) and data and isinstance(data[0], dict):
+            return True  # extraction list without path information: keep it
+
+        settings = QSettings("config.ini", QSettings.Format.IniFormat)
+        label = "original" if temp_path == self.temp_dir_orig else "modified"
+        return same(settings.value(f"last_extract/{label}", ""))
 
     def update_buttons(self, is_finishing=False):
         # Determine if any background task is running

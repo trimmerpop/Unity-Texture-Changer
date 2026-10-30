@@ -16,7 +16,7 @@ PROJECT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT)
 
 from PIL import Image, ImageChops
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QSettings
 from PyQt6.QtWidgets import QApplication
 
 import atlas as atlas_mod
@@ -554,6 +554,95 @@ def test_preview_rebuild():
         remove_tree(root)
 
 
+def test_restart_restore():
+    """Restart after Match: results are restored and the right panel still shows the mod image."""
+    root = tempfile.mkdtemp(prefix="atlas_restart_", dir=os.path.dirname(PROJECT))
+    cwd = os.getcwd()
+    try:
+        orig_dir, mod_dir = prepare_pair(root)
+        if not orig_dir or not mod_dir:
+            print("  SKIP  game folders from config.ini not available")
+            return
+        os.chdir(root)
+        temp_orig = os.path.join(root, "t_orig")
+        temp_mod = os.path.join(root, "t_mod")
+        os.makedirs(temp_orig, exist_ok=True)
+        os.makedirs(temp_mod, exist_ok=True)
+
+        # --- first session: extract + match, then close (saves metadata) ---
+        first = app_main.MainWindow()
+        first.temp_dir_orig = temp_orig
+        first.temp_dir_mod = temp_mod
+        first.orig_path.setText(orig_dir)
+        first.mod_path.setText(mod_dir)
+        data, error = run_worker(
+            "extract", "run_extract",
+            orig_dir=orig_dir, mod_dir=mod_dir, temp_orig=temp_orig, temp_mod=temp_mod,
+            mode="Image", orig_scan_all=False, mod_scan_all=False, atlas_enabled=True,
+        )
+        check("restart: extraction ok", error is None and bool(data), error)
+        first.orig_textures = (data or {}).get("orig", [])
+        first.mod_textures = (data or {}).get("mod", [])
+        first.results = []
+        worker = app_main.WorkerThread("match", orig_textures=first.orig_textures,
+                                       mod_textures=first.mod_textures, num_candidates=5,
+                                       unchecked_same=False, same_res=False,
+                                       filter_enabled=False, sim_cutoff=0.5)
+        captured = {}
+        worker.sig_finished.connect(lambda d: captured.setdefault("d", d))
+        worker.run_match()
+        first.results = captured.get("d") or []
+        check("restart: first session produced results", bool(first.results), len(first.results))
+        first.close()  # closeEvent -> save_settings + _sync_metadata_to_disk
+
+        previews = [r["match_file"] for r in first.results if r.get("match_file")]
+        check("restart: mod previews exist before restart", all(os.path.exists(p) for p in previews))
+
+        # a stale "last_extract" entry must not wipe the cached previews anymore
+        settings = QSettings("config.ini", QSettings.Format.IniFormat)
+        settings.setValue("last_extract/modified", os.path.join(root, "somewhere_else"))
+        settings.sync()
+
+        # --- second session: restart ---
+        second = app_main.MainWindow()
+        second.temp_dir_orig = temp_orig
+        second.temp_dir_mod = temp_mod
+        second.orig_path.setText(orig_dir)
+        second.mod_path.setText(mod_dir)
+        second.restore_matching_results()   # temp dirs are overridden after __init__
+        APP.processEvents()
+
+        check("restart: mod previews survived the restart",
+              all(os.path.exists(p) for p in previews),
+              [p for p in previews if not os.path.exists(p)][:3])
+        check("restart: results were restored", bool(second.results), len(second.results))
+        if not second.results:
+            second.close()
+            return
+
+        item = second.tree.topLevelItem(0)
+        check("restart: atlas cell restored",
+              bool(item and ("%" in item.text(5) or "pcs" in item.text(5))),
+              None if item is None else item.text(5))
+        item.setSelected(True)
+        second.tree.setCurrentItem(item)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            APP.processEvents()
+            pix = second.comp_widget.matched_label.main_pixmap
+            if pix is not None and not pix.isNull():
+                break
+            time.sleep(0.05)
+        matched = second.comp_widget.matched_label.main_pixmap
+        check("restart: right panel shows the mod image",
+              matched is not None and not matched.isNull(),
+              None if matched is None else matched.size())
+        second.close()
+    finally:
+        os.chdir(cwd)
+        remove_tree(root)
+
+
 def main():
     test_legacy_region_apply()
     test_page_mode()
@@ -561,6 +650,7 @@ def main():
     test_stale_metadata()
     test_match_fallback_scan()
     test_preview_rebuild()
+    test_restart_restore()
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")
     if FAILURES:
