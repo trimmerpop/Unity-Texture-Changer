@@ -254,16 +254,10 @@ def get_base_name(name):
 def atlas_keys(texture):
     """Returns (strong, weak) identity keys for an atlas item.
 
-    Atlas file items: strong = "<atlas file>|*",        weak = "<atlas file>"
     Region items:     strong = "<atlas file>|<region>", weak = "<region>"
     Page items:       strong = "<atlas file>|<page>",   weak = "<page>"
-    All are empty for plain images and Unity textures.
+    Both are empty for plain images and Unity textures.
     """
-    item = texture.get('atlas_item') or {}
-    if item:
-        atlas_name = os.path.basename(item.get('atlas_file') or "").lower()
-        return f"{atlas_name}|*", atlas_name
-
     meta = texture.get('atlas') or {}
     name = meta.get('region')
     if name:
@@ -280,55 +274,35 @@ def atlas_keys(texture):
     return "", ""
 
 
-def atlas_pma(texture):
-    """True when the atlas data of this texture uses premultiplied alpha."""
-    meta = texture.get('atlas') or {}
-    if meta:
-        return bool(meta.get('pma'))
-    item = texture.get('atlas_item') or {}
-    if item:
-        return bool(item.get('pma'))
-    return bool((texture.get('atlas_page') or {}).get('pma'))
+def atlas_page_label(meta):
+    """'page 2/3 (hina_cg1_2.png) of hina_cg1.atlas' for a page item, else ''.
 
-
-def refresh_atlas_preview(texture):
-    """Rewrites the preview PNG of an atlas item/page from its (updated) first page."""
-    meta = texture.get('atlas_item') or texture.get('atlas_page') or {}
-    page_file = meta.get('page_file') or ''
-    save_path = texture.get('save_path') or ''
-    if not page_file or not save_path:
-        return False
-    image = atlas_mod.load_page_image(page_file)
-    if image is None:
-        return False
-    preview = image.copy()
-    if max(preview.size) > 1024:
-        preview.thumbnail((1024, 1024), Image.Resampling.BOX)
-    try:
-        preview.save(save_path, format="PNG")
-        return True
-    except Exception:
-        return False
+    A multi-page .atlas is several image files on disk, so every page is its own item; the
+    label makes clear which page of which atlas a row belongs to.
+    """
+    atlas_name = os.path.basename(meta.get('atlas_file') or '')
+    page_name = meta.get('page_name') or os.path.basename(meta.get('page_file') or '')
+    if not atlas_name and not page_name:
+        return ""
+    number, count = meta.get('page_number'), meta.get('page_count')
+    position = f"page {number}/{count} " if number and count else "page "
+    return f"{position}({page_name}) of {atlas_name}" if atlas_name else f"{position}({page_name})"
 
 
 _ATLAS_REGION_CACHE = {}
 
 
-def _parse_atlas_cached(path):
-    """Parses one .atlas file (shared by page items and whole-atlas items)."""
+def atlas_page_regions(meta):
+    """Regions of one atlas page, parsed once per .atlas file (cached)."""
+    path = meta.get('atlas_file') or ''
     if not path:
-        return None
+        return []
     if path not in _ATLAS_REGION_CACHE:
         try:
             _ATLAS_REGION_CACHE[path] = atlas_mod.parse_atlas(path)
         except Exception:
             _ATLAS_REGION_CACHE[path] = None
-    return _ATLAS_REGION_CACHE[path]
-
-
-def atlas_page_regions(meta):
-    """Regions of one atlas page, parsed once per .atlas file (cached)."""
-    atlas = _parse_atlas_cached(meta.get('atlas_file') or '')
+    atlas = _ATLAS_REGION_CACHE[path]
     if atlas is None:
         return []
     page_name = os.path.basename(meta.get('page_file') or '')
@@ -336,89 +310,6 @@ def atlas_page_regions(meta):
         if os.path.basename(page.name) == page_name:
             return page.regions
     return []
-
-
-def atlas_item_layout(meta):
-    """Maps piece key -> region for every page of a whole-atlas item."""
-    atlas = _parse_atlas_cached(meta.get('atlas_file') or '')
-    if atlas is None or not atlas.pages:
-        return {}
-    return atlas_mod.atlas_piece_layout(atlas)
-
-
-def atlas_item_page_files(meta):
-    """Maps page file name -> absolute image path for a whole-atlas item."""
-    files = {}
-    for page in (meta.get('pages') or []):
-        name = os.path.basename(page.get('page') or '')
-        if name and page.get('file'):
-            files[name] = page['file']
-    return files
-
-
-def atlas_item_stats(orig_meta, mod_meta, verify=True):
-    """Piece statistics between two whole atlases (all of their pages).
-
-    A multi-page atlas (1p.png, 1p_2.png, ...) is compared as one item, so the pieces of
-    every page take part and a piece that moved to another page still counts as the same.
-    """
-    orig_layout = atlas_item_layout(orig_meta)
-    mod_layout = atlas_item_layout(mod_meta)
-    orig_digests = orig_meta.get('digests') or {}
-    mod_digests = mod_meta.get('digests') or {}
-    if not orig_layout or not mod_layout or not orig_digests or not mod_digests:
-        return atlas_mod.PageStats()
-    stats = atlas_mod.compare_piece_layouts(orig_digests, mod_digests, orig_layout, mod_layout)
-    if stats.changed == 0 or not verify:
-        return stats
-    return _atlas_item_verify_pixels(orig_digests, mod_digests, orig_layout, mod_layout,
-                                     atlas_item_page_files(orig_meta),
-                                     atlas_item_page_files(mod_meta))
-
-
-def _atlas_item_verify_pixels(orig_digests, mod_digests, orig_layout, mod_layout,
-                              orig_files, mod_files):
-    """Re-checks the changed pieces of two atlases with the pixel tolerance."""
-    pages_orig, pages_mod = {}, {}
-
-    def page_image(cache, files, page_name):
-        if page_name not in cache:
-            cache[page_name] = atlas_mod.load_page_image(files.get(page_name, ''))
-        return cache[page_name]
-
-    stats = atlas_mod.PageStats()
-    for key, digest in orig_digests.items():
-        twin = mod_digests.get(key)
-        if twin is None:
-            stats.missing += 1
-            continue
-        stats.pieces += 1
-        identical = digest == twin
-        a, b = orig_layout.get(key), mod_layout.get(key)
-        if not identical and a and b:
-            image_a = page_image(pages_orig, orig_files, a.page)
-            image_b = page_image(pages_mod, mod_files, b.page)
-            if image_a is not None and image_b is not None:
-                try:
-                    identical = atlas_mod.pieces_near_identical(
-                        atlas_mod.unpack_region(image_a, a), atlas_mod.unpack_region(image_b, b))
-                except Exception:
-                    identical = False
-        if identical:
-            stats.identical += 1
-        else:
-            stats.changed += 1
-        if a and b:
-            if (a.width, a.height) != (b.width, b.height):
-                stats.trimmed += 1
-            elif a.rotate != b.rotate:
-                stats.rotated += 1
-            elif (a.x, a.y) != (b.x, b.y):
-                stats.moved += 1
-    for key in mod_digests:
-        if key not in orig_digests:
-            stats.extra += 1
-    return stats
 
 
 def atlas_page_stats(orig_meta, mod_meta, verify=True):
@@ -601,12 +492,11 @@ class WorkerThread(QThread):
         mod_image = atlas_mod.load_page_image(mod_meta.get('page_file', ''))
         if mod_image is None:
             return 0
-        mod_by = {atlas_mod.region_key(r.name): r for r in mod_regions}
+        mod_by = dict(zip(atlas_mod.piece_keys(mod_regions), mod_regions))
         digests = dict(orig_meta.get('digests') or {})
         orig_image = atlas_mod.load_page_image(page_path)
         updates = []
-        for region in orig_regions:
-            key = atlas_mod.region_key(region.name)
+        for key, region in zip(atlas_mod.piece_keys(orig_regions), orig_regions):
             twin = mod_by.get(key)
             if twin is None:
                 continue
@@ -638,73 +528,6 @@ class WorkerThread(QThread):
         orig_meta['digests'] = digests  # keep the metadata in sync with the page
         return len(updates)
 
-    @staticmethod
-    def _apply_atlas_item(orig_meta, mod_meta):
-        """Writes every changed piece of a matched atlas back into the ORIGINAL pages.
-
-        An atlas item covers all pages of the .atlas file, so each changed piece is
-        composited into the page that owns it in the original build; unchanged pieces keep
-        the original pixels, which preserves the original packing exactly.
-        Returns the number of pieces that were written.
-        """
-        orig_layout = atlas_item_layout(orig_meta)
-        mod_layout = atlas_item_layout(mod_meta)
-        if not orig_layout or not mod_layout:
-            return 0
-        orig_pages = atlas_item_page_files(orig_meta)
-        mod_pages = atlas_item_page_files(mod_meta)
-        digests = dict(orig_meta.get('digests') or {})
-        mod_pma = bool(mod_meta.get('pma'))
-        updates_by_page = {}
-        orig_images, mod_images = {}, {}
-
-        def image(cache, files, page_name):
-            if page_name not in cache:
-                cache[page_name] = atlas_mod.load_page_image(files.get(page_name, ''))
-            return cache[page_name]
-
-        for key, region in orig_layout.items():
-            twin = mod_layout.get(key)
-            if twin is None:
-                continue
-            mod_image = image(mod_images, mod_pages, twin.page)
-            if mod_image is None:
-                continue
-            try:
-                piece = atlas_mod.unpack_region(mod_image, twin)
-            except Exception:
-                continue
-            digest = atlas_mod.piece_digest(piece)
-            if digests.get(key) == digest:
-                continue  # identical piece -> keep the original pixels
-            # Pixel verification: a piece that only differs by re-encode noise stays as is,
-            # while real edits (mosaic, redraw) are always written.
-            orig_image = image(orig_images, orig_pages, region.page)
-            if orig_image is not None:
-                try:
-                    if atlas_mod.pieces_near_identical(atlas_mod.unpack_region(orig_image, region), piece):
-                        digests[key] = digest
-                        continue
-                except Exception:
-                    pass
-            updates_by_page.setdefault(region.page, []).append((region, piece, mod_pma))
-            digests[key] = digest
-
-        written = 0
-        for page_name, updates in updates_by_page.items():
-            page_path = orig_pages.get(page_name, '')
-            if not page_path or not os.path.exists(page_path):
-                continue
-            if atlas_mod.write_page_regions(page_path, updates):
-                written += len(updates)
-        orig_meta['digests'] = digests  # keep the metadata in sync with the pages
-        return written
-
-    @staticmethod
-    def _refresh_atlas_preview(texture):
-        """Rewrites the item preview PNG from the first page of the (updated) original atlas."""
-        return refresh_atlas_preview(texture)
-
     def run_apply(self):
         to_replace = self.args['to_replace']
         orig_dir = self.args['orig_dir']
@@ -726,11 +549,10 @@ class WorkerThread(QThread):
         if high_quality and save_as_original and mode in ("Unity", "Unity APK"):
             self.sig_log.emit("High Quality (BC7) is enabled: Unity textures are saved as BC7, 'Save as original format' is skipped for them.")
         
-        # 1. GROUPING: Separate Unity, atlas-item, atlas-page and direct file replacements
+        # 1. GROUPING: Separate Unity, atlas-page and direct file replacements
         unity_groups = {} # source_file -> {'replacements': [], 'results': []}
         atlas_groups = {} # original atlas page image -> [results] (per region mode)
         atlas_page_groups = {} # original atlas page image -> [results] (page mode)
-        atlas_item_groups = {} # original .atlas file -> [results] (whole atlas mode)
         direct_files = [] # list of results handled by plain file copy
         
         for res in to_replace:
@@ -740,10 +562,7 @@ class WorkerThread(QThread):
             
             atlas_meta = o.get('atlas') or {}
             atlas_page_meta = o.get('atlas_page') or {}
-            atlas_item_meta = o.get('atlas_item') or {}
-            if atlas_item_meta.get('atlas_file'):
-                atlas_item_groups.setdefault(atlas_item_meta['atlas_file'], []).append(res)
-            elif atlas_page_meta.get('page_file'):
+            if atlas_page_meta.get('page_file'):
                 page_path = atlas_page_meta['page_file']
                 if not os.path.exists(page_path):
                     candidate = os.path.join(orig_dir, os.path.basename(page_path))
@@ -772,38 +591,11 @@ class WorkerThread(QThread):
                 direct_files.append(res)
 
         total_unity = sum(len(data['replacements']) for data in unity_groups.values())
-        total_atlas = (sum(len(v) for v in atlas_groups.values())
-                       + sum(len(v) for v in atlas_page_groups.values())
-                       + sum(len(v) for v in atlas_item_groups.values()))
+        total_atlas = sum(len(v) for v in atlas_groups.values()) + sum(len(v) for v in atlas_page_groups.values())
         total_direct = len(direct_files)
         
         processed_count = 0
         
-        # 2. PHASE 0: whole atlases -> changed pieces written into their original pages
-        if atlas_item_groups:
-            self.sig_log.emit(f"Writing {sum(len(v) for v in atlas_item_groups.values())} atlas item(s)...")
-            for atlas_file, results in atlas_item_groups.items():
-                for res in results:
-                    meta = res['original'].get('atlas_item') or {}
-                    mod_meta = res.get('match_atlas_item') or {}
-                    name = os.path.basename(atlas_file)
-                    if not mod_meta:
-                        self.sig_log.emit(f"ERROR: Matched atlas data missing for {name}. Skipping.")
-                        processed_count += 1
-                        continue
-                    self.sig_progress.emit(int((processed_count/total)*100),
-                                           f"Updating atlas {name}...")
-                    updated = self._apply_atlas_item(meta, mod_meta)
-                    if updated:
-                        count += updated
-                        self.sig_log.emit(f"Atlas updated: {name} ({updated} piece(s) changed "
-                                          f"across {len(meta.get('pages') or [])} page(s), "
-                                          f"original layout kept)")
-                        self._refresh_atlas_preview(res['original'])
-                    else:
-                        self.sig_log.emit(f"Atlas unchanged: {name}")
-                    processed_count += 1
-
         # 2. PHASE 0: Atlas pages -> write only the changed pieces, at the ORIGINAL layout
         if atlas_page_groups:
             self.sig_log.emit(f"Writing {sum(len(v) for v in atlas_page_groups.values())} atlas page(s)...")
@@ -1103,16 +895,16 @@ class WorkerThread(QThread):
 
         atlas_enabled = bool(self.args.get('atlas_enabled', True))
         atlas_files = atlas_mod.find_atlas_files(folder) if atlas_enabled else []
-        atlas_out_dir = os.path.join(temp_path, "atlas")
+        used_names = set()
         for atlas_path in atlas_files:
             atlas = atlas_mod.parse_atlas(atlas_path)
             if not atlas.pages:
                 continue
-            entries = atlas_mod.extract_atlas_item(atlas_path, atlas_out_dir,
-                                                   log_callback=self.sig_log.emit)
+            out_dir = os.path.join(temp_path, "atlas", os.path.splitext(os.path.basename(atlas_path))[0])
+            entries = atlas_mod.extract_atlas_pages(atlas_path, out_dir, log_callback=self.sig_log.emit,
+                                                   used_names=used_names)
             if entries:
-                self.sig_log.emit(f"Atlas {os.path.basename(atlas_path)}: "
-                                  f"{len(atlas.pages)} page(s) merged into 1 item -> {label}")
+                self.sig_log.emit(f"Atlas {os.path.basename(atlas_path)}: {len(entries)} page item(s) -> {label}")
             for page in atlas.pages:
                 page_path = os.path.abspath(atlas.page_path(page))
                 page_images.add(os.path.normcase(page_path))
@@ -1241,25 +1033,24 @@ class WorkerThread(QThread):
                                     else:
                                         t['size'] = 0
                         # An extraction made by an older version may describe per-region items,
-                        # per-page items or atlas items without piece data; the Atlas column
-                        # would then stay empty and the comparison would have nothing to use.
+                        # page items without piece digests or merged atlas items; the Atlas
+                        # column would then stay empty or pages would be hidden behind one row.
                         if self.args.get('atlas_enabled', True) and isinstance(textures, list):
                             for t in textures:
                                 if not isinstance(t, dict):
                                     continue
                                 meta = t.get('atlas') or {}
                                 page = t.get('atlas_page') or {}
-                                item = t.get('atlas_item') or {}
                                 if meta.get('region'):
                                     self.sig_log.emit(f"Stored {label} extraction uses the old per-region layout; re-extracting.")
                                     textures = None
                                     break
-                                if page:
-                                    # one item per page is the old layout; an atlas is one item
-                                    self.sig_log.emit(f"Stored {label} extraction splits atlases into pages; re-extracting.")
+                                if t.get('atlas_item'):
+                                    # one row per .atlas file hides the single page files
+                                    self.sig_log.emit(f"Stored {label} extraction merges atlas pages; re-extracting.")
                                     textures = None
                                     break
-                                if item and (not item.get('digests') or not item.get('pages')):
+                                if page and not page.get('digests'):
                                     self.sig_log.emit(f"Stored {label} extraction lacks atlas piece data; re-extracting.")
                                     textures = None
                                     break
@@ -1407,34 +1198,25 @@ class WorkerThread(QThread):
 
             candidate_pool = {} # save_path -> m_tex
             o_page = o_tex.get('atlas_page') or {}
-            o_item = o_tex.get('atlas_item') or {}
             all_potentials = []
 
-            # ---- Atlas items: one row per .atlas file, all of its pages are compared ----
-            if o_item or o_page:
+            # ---- Atlas page items: one row per page, pieces compared internally ----
+            if o_page:
                 o_strong, o_weak = atlas_keys(o_tex)
                 plain_pool = []
                 for m_tex in mod_textures:
                     m_page = m_tex.get('atlas_page') or {}
-                    m_item = m_tex.get('atlas_item') or {}
                     m_strong, m_weak = atlas_keys(m_tex)
-                    is_identity = bool(o_weak) and o_weak == m_weak and bool(m_item or m_page)
-                    if not (m_item or m_page):
+                    is_identity = bool(o_weak) and o_weak == m_weak and bool(m_page)
+                    if not m_page:
                         # plain images are still candidates, but only the closest ones are
                         # compared precisely (a web game can hold hundreds of them)
                         plain_pool.append(m_tex)
                         continue
-                    # the atlas overlap is authoritative for atlas items; the plain preview
-                    # similarity is merged in so an atlas match of 90% outranks a plain 50%
+                    # the atlas overlap is authoritative for pages; the plain page similarity
+                    # is merged in so an atlas match of 90% outranks a plain match of 50%
                     plain_sim = compare_images_fast(o_tex['save_path'], m_tex['save_path'], trim=True) if is_identity else 0.0
-                    if o_item:
-                        if not m_item:
-                            continue
-                        stats = atlas_item_stats(o_item, m_item, verify=verify_pages)
-                    else:
-                        if not m_page:
-                            continue
-                        stats = atlas_page_stats(o_page, m_page, verify=verify_pages)
+                    stats = atlas_page_stats(o_page, m_page, verify=verify_pages)
                     if stats.total <= 0:
                         continue
                     all_potentials.append({
@@ -1445,7 +1227,7 @@ class WorkerThread(QThread):
                         'is_exact': is_identity,
                         'is_same_res': (m_tex.get('width') == o_tex.get('width')
                                         and m_tex.get('height') == o_tex.get('height')),
-                        'atlas_state': "atlas" if o_item else "page",
+                        'atlas_state': "page",
                         'atlas_text': stats.summary(),
                         'atlas_detail': stats.detail(),
                         'match_by': "atlas" if is_identity else "sim",
@@ -1586,7 +1368,7 @@ class WorkerThread(QThread):
                     "similarity": round(r['similarity'], 4),
                     "is_exact": r['is_exact'],
                     "is_same_res": r['is_same_res'],
-                    "pma": atlas_pma(m_t),
+                    "pma": bool((m_t.get('atlas') or {}).get('pma')),
                     "atlas_state": r['atlas_state'],
                     "atlas_text": r['atlas_text'],
                     "atlas_detail": r['atlas_detail'],
@@ -1607,7 +1389,7 @@ class WorkerThread(QThread):
                     "similarity": round(best_candidate['similarity'], 4),
                     "is_exact": best_candidate['is_exact'],
                     "is_same_res": best_candidate['is_same_res'],
-                    "pma": atlas_pma(m_t),
+                    "pma": bool((m_t.get('atlas') or {}).get('pma')),
                     "atlas_state": best_candidate['atlas_state'],
                     "atlas_text": best_candidate['atlas_text'],
                     "atlas_detail": best_candidate['atlas_detail'],
@@ -1624,18 +1406,17 @@ class WorkerThread(QThread):
             elif best_similarity >= 1.0 and unchecked_same:
                 # Already identical
                 should_replace = False
-            if (o_item or o_page) and (best_candidate.get('atlas_ratio') or 0.0) >= 1.0:
-                # every piece of the atlas is the same -> nothing to write
+            if o_page and (best_candidate.get('atlas_ratio') or 0.0) >= 1.0:
+                # every piece of the page is the same -> nothing to write
                 should_replace = False
 
             best_page_meta = best_candidate['tex'].get('atlas_page') or {}
-            best_item_meta = best_candidate['tex'].get('atlas_item') or {}
             results.append({
                 "original": o_tex,
                 "match_file": best_match_path,
                 # True when the replacement already uses the original page's alpha
                 # convention (atlas region taken from a premultiplied page)
-                "match_pma": atlas_pma(best_candidate['tex']),
+                "match_pma": bool((best_candidate['tex'].get('atlas') or {}).get('pma')),
                 "best_similarity": best_similarity,
                 "candidates": candidates,
                 # how the two builds packed this region + reason of the pairing
@@ -1650,8 +1431,6 @@ class WorkerThread(QThread):
                 "match_page_file": best_page_meta.get('page_file', ''),
                 "match_atlas_file": best_page_meta.get('atlas_file', ''),
                 "match_page_pma": bool(best_page_meta.get('pma')),
-                # whole-atlas items need every page of the matched atlas
-                "match_atlas_item": best_item_meta,
                 "replace": should_replace
             })
             if best_candidate['match_by'] == "atlas":
@@ -1871,30 +1650,7 @@ class MainWindow(QMainWindow):
                 self.log(f"Overwrote Modified Path: {resolved_path}")
 
     def _rebuild_atlas_preview(self, texture, temp_path):
-        """Regenerates the preview PNG of an atlas item (e.g. after Clear temp)."""
-        meta = texture.get('atlas_item') or {}
-        if meta:
-            page_file = meta.get('page_file') or ''
-            if not page_file or not os.path.exists(page_file):
-                return None
-            if not meta.get('digests'):
-                page_image = atlas_mod.load_page_image(page_file)
-                atlas = _parse_atlas_cached(meta.get('atlas_file') or '')
-                if page_image is not None and atlas is not None:
-                    meta['digests'] = atlas_mod.atlas_piece_digests(
-                        atlas, {os.path.basename(page_file): page_image})
-            atlas_stem = os.path.splitext(os.path.basename(meta.get('atlas_file') or 'atlas'))[0]
-            out_dir = os.path.join(temp_path, "atlas")
-            try:
-                os.makedirs(out_dir, exist_ok=True)
-            except Exception:
-                return None
-            texture = dict(texture)
-            texture['save_path'] = os.path.join(out_dir, f"{atlas_stem}.png")
-            if refresh_atlas_preview(texture):
-                return texture['save_path']
-            return None
-
+        """Regenerates the preview PNG of an atlas page item (e.g. after Clear temp)."""
         meta = texture.get('atlas_page') or {}
         page_file = meta.get('page_file') or ''
         if not page_file or not os.path.exists(page_file):
@@ -1935,8 +1691,7 @@ class MainWindow(QMainWindow):
             
             # 1b. A missing preview (cleared temp folder) is rebuilt from the atlas page,
             #     so Match does not silently skip every item.
-            if (t.get('save_path') and not os.path.exists(t['save_path'])
-                    and (t.get('atlas_page') or t.get('atlas_item'))):
+            if t.get('save_path') and not os.path.exists(t['save_path']) and t.get('atlas_page'):
                 rebuilt = self._rebuild_atlas_preview(t, temp_path)
                 if rebuilt:
                     t['save_path'] = rebuilt
@@ -2977,19 +2732,20 @@ class MainWindow(QMainWindow):
         page_paths = set()
         if hasattr(self, "chk_atlas") and self.chk_atlas.isChecked() and temp_path:
             atlas_files = atlas_mod.find_atlas_files(folder)
-            atlas_out_dir = os.path.join(temp_path, "atlas")
+            used_names = set()
             for atlas_path in atlas_files:
                 atlas = atlas_mod.parse_atlas(atlas_path)
                 if not atlas.pages:
                     continue
-                entries = atlas_mod.extract_atlas_item(atlas_path, atlas_out_dir,
-                                                       log_callback=self.log)
+                out_dir = os.path.join(temp_path, "atlas",
+                                       os.path.splitext(os.path.basename(atlas_path))[0])
+                entries = atlas_mod.extract_atlas_pages(atlas_path, out_dir, log_callback=self.log,
+                                                        used_names=used_names)
                 textures.extend(entries)
                 for page in atlas.pages:
                     page_paths.add(os.path.normcase(os.path.abspath(atlas.page_path(page))))
             if textures:
-                self.log(f"Atlas files found: {len(textures)} item(s) "
-                         f"(all pages of an atlas are compared together)")
+                self.log(f"Atlas pages found: {len(textures)} item(s) (pieces compared per page)")
 
         for root, dirs, fnames in os.walk(folder):
             for f in fnames:
@@ -3156,16 +2912,17 @@ class MainWindow(QMainWindow):
             atlas_state = res.get('atlas_state')
             atlas_text = res.get('atlas_text')
             atlas_detail = res.get('atlas_detail')
-            item_meta = orig.get('atlas_item') or {}
             page_meta = orig.get('atlas_page') or {}
-            if not atlas_text and (item_meta or page_meta):
-                # an atlas that has not been matched yet: show the piece count so the
+            page_label = atlas_page_label(page_meta)
+            if not atlas_text and page_meta:
+                # an atlas page that has not been matched yet: show the piece count so the
                 # column is never blank for an atlas item
-                atlas_state = "atlas" if item_meta else "page"
-                pieces = item_meta.get('pieces', 0) or page_meta.get('pieces', 0)
-                pages = len(item_meta.get('pages') or []) or 1
-                atlas_text = f"{pieces} pcs" + (f", {pages}p" if pages > 1 else "")
+                atlas_state = "page"
+                atlas_text = f"{page_meta.get('pieces', 0)} pcs"
                 atlas_detail = "Not matched yet - run Match to compute the piece overlap."
+            if page_label:
+                # e.g. "page 2/3 (hina_cg1_2.png) of hina_cg1.atlas": every page is its own item
+                atlas_detail = (atlas_detail + "\n\n" + page_label).strip()
             self._apply_atlas_cell(item, atlas_state, atlas_text, atlas_detail,
                                    ratio=(res.get('piece_stats') or {}).get('ratio'))
 
@@ -3273,7 +3030,6 @@ class MainWindow(QMainWindow):
             "rotated": QColor(255, 179, 0),
             "resized": QColor(244, 81, 30),   # orange: trim differs, score is squeezed
             "page": QColor(66, 165, 245),     # blue: whole atlas page compared by pieces
-            "atlas": QColor(66, 165, 245),    # blue: whole atlas file compared by pieces
             "none": QColor(150, 150, 150),
         }
         state = state or "none"
@@ -3284,8 +3040,6 @@ class MainWindow(QMainWindow):
         tip = detail or ""
         if state == "page":
             tip += "\n\nSimilarity = same pieces / all pieces of the page."
-        elif state == "atlas":
-            tip += "\n\nSimilarity = same pieces / all pieces of the atlas (every page counts)."
         elif state == "resized":
             tip += "\n\nThe trim differs between the builds; the similarity above is trim-normalised."
         elif state in ("moved", "rotated"):
@@ -3318,21 +3072,23 @@ class MainWindow(QMainWindow):
             atlas_state = res_data.get('atlas_state')
             atlas_text = res_data.get('atlas_text')
             atlas_detail = res_data.get('atlas_detail')
+        # keep telling which page of which atlas this row is (e.g. page 2/3 of hina_cg1.atlas)
+        page_label = atlas_page_label(orig.get('atlas_page') or {})
+        if page_label:
+            atlas_detail = ((atlas_detail or "") + "\n\n" + page_label).strip()
         self._apply_atlas_cell(item, atlas_state, atlas_text, atlas_detail,
                                ratio=(res_data.get('piece_stats') or {}).get('ratio'))
         if (orig.get('atlas') or {}).get('region'):
             item.setToolTip(COL_SIM, "Trim-normalised similarity (transparent borders ignored)\n"
                                f"matched by: {res_data.get('match_by', 'sim')}")
-        elif orig.get('atlas_item') or orig.get('atlas_page'):
+        elif orig.get('atlas_page'):
             stats = res_data.get('piece_stats') or {}
-            where = "atlas"
-            if orig.get('atlas_item'):
-                pages = len((orig.get('atlas_item') or {}).get('pages') or [])
-                where = f"atlas ({pages} page(s))"
-            item.setToolTip(COL_SIM, f"Piece overlap: identical pieces / all pieces of the {where}\n"
+            label = atlas_page_label(orig.get('atlas_page') or {})
+            item.setToolTip(COL_SIM, "Piece overlap: identical pieces / all pieces of the page\n"
                                f"{stats.get('identical', 0)} same, {stats.get('changed', 0)} changed "
                                f"of {stats.get('pieces', 0)}\n"
-                               f"matched by: {res_data.get('match_by', 'sim')}")
+                               + (f"{label}\n" if label else "")
+                               + f"matched by: {res_data.get('match_by', 'sim')}")
 
         # Right-align numeric columns (Match update)
         for col in [COL_SIM, COL_PATHID, COL_MRES, COL_MSIZE]:
@@ -4258,7 +4014,6 @@ class MainWindow(QMainWindow):
             all_potentials = []
             from similarity import compare_images, compare_images_fast
             o_page = orig.get('atlas_page') or {}
-            o_item = orig.get('atlas_item') or {}
             for m_tex in candidate_pool.values():
                 refined_sim = compare_images_fast(orig['save_path'], m_tex['save_path'], trim=is_atlas_item)
                 m_atlas_strong, m_atlas_weak = atlas_keys(m_tex)
@@ -4267,14 +4022,7 @@ class MainWindow(QMainWindow):
                 )
                 is_exact = is_atlas_pair or (m_tex.get('name', '').lower() == o_name_lower)
                 geo_state, geo_text, geo_detail = atlas_geometry(orig, m_tex)
-                if o_item and m_tex.get('atlas_item'):
-                    # keep the whole-atlas overlap after an apply (otherwise the Atlas column
-                    # would fall back to "-" once the result is recalculated)
-                    stats = atlas_item_stats(o_item, m_tex['atlas_item'], verify=False)
-                    if stats.total > 0:
-                        geo_state, geo_text, geo_detail = "atlas", stats.summary(), stats.detail()
-                        refined_sim = max(refined_sim, stats.ratio)
-                elif o_page and m_tex.get('atlas_page'):
+                if o_page and m_tex.get('atlas_page'):
                     # keep the page overlap after an apply (otherwise the Atlas column would
                     # fall back to "-" once the result is recalculated)
                     stats = atlas_page_stats(o_page, m_tex['atlas_page'], verify=False)
@@ -4312,11 +4060,7 @@ class MainWindow(QMainWindow):
             best_candidate = max(final_refined, key=best_sort_key)
             res['match_file'] = best_candidate['tex']['save_path']
             res['best_similarity'] = best_candidate['similarity']
-            res['match_pma'] = atlas_pma(best_candidate['tex'])
-            # the apply phase needs the matched atlas data (all pages of it)
-            res['match_atlas_item'] = best_candidate['tex'].get('atlas_item') or {}
-            res['match_page_file'] = (best_candidate['tex'].get('atlas_page') or {}).get('page_file', '')
-            res['match_atlas_file'] = (best_candidate['tex'].get('atlas_page') or {}).get('atlas_file', '')
+            res['match_pma'] = bool((best_candidate['tex'].get('atlas') or {}).get('pma'))
             res['atlas_state'] = best_candidate['atlas_state']
             res['atlas_text'] = best_candidate['atlas_text']
             res['atlas_detail'] = best_candidate['atlas_detail']
@@ -4337,7 +4081,7 @@ class MainWindow(QMainWindow):
                     "similarity": round(r['similarity'], 4),
                     "is_exact": r['is_exact'],
                     "is_same_res": r['is_same_res'],
-                    "pma": atlas_pma(m_t),
+                    "pma": bool((m_t.get('atlas') or {}).get('pma')),
                     "atlas_state": r['atlas_state'],
                     "atlas_text": r['atlas_text'],
                     "atlas_detail": r['atlas_detail'],
