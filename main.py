@@ -23,6 +23,11 @@ from concurrent.futures import ThreadPoolExecutor
 from packaging import version
 import ctypes
 
+# Result tree columns (the Atlas column sits right next to Similarity)
+COL_REPLACE, COL_NAME, COL_RES, COL_SIZE, COL_SIM, COL_ATLAS, \
+    COL_ASSETS, COL_PATHID, COL_MATCH, COL_MRES, COL_MSIZE = range(11)
+
+
 class SortableTreeWidgetItem(QTreeWidgetItem):
     @staticmethod
     def natural_key(text):
@@ -87,11 +92,11 @@ class SortableTreeWidgetItem(QTreeWidgetItem):
             if p1 != p2: return p1 < p2
             return False
 
-        # Atlas column (10) sorts by the stored numeric ratio (percent text would sort wrong)
-        if column == 10:
+        # Atlas column sorts by the stored numeric ratio (percent text would sort wrong)
+        if column == COL_ATLAS:
             try:
-                r1 = self.data(10, Qt.ItemDataRole.UserRole)
-                r2 = other.data(10, Qt.ItemDataRole.UserRole)
+                r1 = self.data(COL_ATLAS, Qt.ItemDataRole.UserRole)
+                r2 = other.data(COL_ATLAS, Qt.ItemDataRole.UserRole)
                 v1 = float(r1) if r1 is not None else -1.0
                 v2 = float(r2) if r2 is not None else -1.0
                 if v1 != v2:
@@ -100,11 +105,11 @@ class SortableTreeWidgetItem(QTreeWidgetItem):
                 pass
             return tie_breaker()
 
-        # If this is a child item (Candidate), ALWAYS sort by Similarity (Col 4) DESCENDING
+        # If this is a child item (Candidate), ALWAYS sort by Similarity DESCENDING
         if self.parent():
             try:
-                s1 = float(self.text(4) or "0")
-                s2 = float(other.text(4) or "0")
+                s1 = float(self.text(COL_SIM) or "0")
+                s2 = float(other.text(COL_SIM) or "0")
                 if s1 != s2:
                     if order == Qt.SortOrder.AscendingOrder:
                         return s1 > s2
@@ -113,16 +118,16 @@ class SortableTreeWidgetItem(QTreeWidgetItem):
             except: pass
             return tie_breaker()
 
-        # Column 0: Replace Checkbox (Parents Only)
-        if column == 0:
-            v1 = self.data(0, Qt.ItemDataRole.UserRole)
-            v2 = other.data(0, Qt.ItemDataRole.UserRole)
+        # Replace checkbox (Parents Only)
+        if column == COL_REPLACE:
+            v1 = self.data(COL_REPLACE, Qt.ItemDataRole.UserRole)
+            v2 = other.data(COL_REPLACE, Qt.ItemDataRole.UserRole)
             if v1 is not None and v2 is not None:
                 if v1 != v2:
                     return v1 > v2  # Checked before Unchecked
 
-        # Natural sorting for Name (1, 7) or Assets (5) or Match File (7)
-        if column in (1, 5, 7):
+        # Natural sorting for Name, Assets and Match File
+        if column in (COL_NAME, COL_ASSETS, COL_MATCH):
             t1 = self.text(column)
             t2 = other.text(column)
             n1 = self.natural_key(t1)
@@ -131,31 +136,31 @@ class SortableTreeWidgetItem(QTreeWidgetItem):
             if t1 != t2: return t1 < t2
             return tie_breaker()
 
-        # Column 2, 8: Resolution (Numeric)
-        if column in (2, 8):
+        # Resolution (Numeric)
+        if column in (COL_RES, COL_MRES):
             v1 = self.get_pixels(self.text(column))
             v2 = self.get_pixels(other.text(column))
             if v1 != v2: return v1 < v2
 
-        # Column 3, 9: Size (Numeric)
-        if column in (3, 9):
+        # Size (Numeric)
+        if column in (COL_SIZE, COL_MSIZE):
             v1 = self.get_bytes(self.text(column))
             v2 = self.get_bytes(other.text(column))
             if v1 != v2: return v1 < v2
 
-        # Column 4: Similarity (Numeric)
-        if column == 4:
+        # Similarity (Numeric)
+        if column == COL_SIM:
             try:
-                s1 = float(self.text(4) or "0")
-                s2 = float(other.text(4) or "0")
+                s1 = float(self.text(COL_SIM) or "0")
+                s2 = float(other.text(COL_SIM) or "0")
                 if s1 != s2: return s1 < s2
             except: pass
 
-        # Column 6: PathID (Numeric)
-        if column == 6:
+        # PathID (Numeric)
+        if column == COL_PATHID:
             try:
-                v1 = int(self.text(6) or "0")
-                v2 = int(other.text(6) or "0")
+                v1 = int(self.text(COL_PATHID) or "0")
+                v2 = int(other.text(COL_PATHID) or "0")
                 if v1 != v2: return v1 < v2
             except: pass
 
@@ -1954,7 +1959,8 @@ class MainWindow(QMainWindow):
         self.tree = EnhancedTreeWidget()
         self.tree.setColumnCount(11)
         self.tree.setHeaderLabels([
-            "Replace", "Name", "Res", "Size", "Similarity", "Assets", "PathID", "Match File", "M-Res", "M-Size", "Atlas"
+            "Replace", "Name", "Res", "Size", "Similarity", "Atlas",
+            "Assets", "PathID", "Match File", "M-Res", "M-Size"
         ])
         
         # --- UI Styling ---
@@ -1983,10 +1989,10 @@ class MainWindow(QMainWindow):
         # All columns are interactive
         self.tree.header().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.tree.header().setStretchLastSection(False)
-        self.tree.setColumnWidth(10, 150)  # Atlas (packing geometry of the matched region)
+        self.tree.setColumnWidth(COL_ATLAS, 150)  # Atlas (packing geometry of the matched region)
         
         # Set alignment for numeric headers
-        for i in [2, 3, 4, 6, 8, 9]:
+        for i in [COL_RES, COL_SIZE, COL_SIM, COL_PATHID, COL_MRES, COL_MSIZE]:
             self.tree.headerItem().setTextAlignment(i, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.tree.installEventFilter(self)
@@ -2795,18 +2801,18 @@ class MainWindow(QMainWindow):
             item.setCheckState(0, Qt.CheckState.Checked if is_replace else Qt.CheckState.Unchecked)
             item.setData(0, Qt.ItemDataRole.UserRole, is_replace)
             
-            item.setText(1, orig.get('name', 'Unknown'))
-            item.setText(2, f"{orig.get('width', 0)}x{orig.get('height', 0)}")
-            item.setText(3, f"{orig.get('size', 0)/1024:.1f} KB")
+            item.setText(COL_NAME, orig.get('name', 'Unknown'))
+            item.setText(COL_RES, f"{orig.get('width', 0)}x{orig.get('height', 0)}")
+            item.setText(COL_SIZE, f"{orig.get('size', 0)/1024:.1f} KB")
 
-            # Assets (5) and PathID (6)
+            # Assets and PathID
             s_asset = orig.get('source_asset', '')
             if s_asset:
-                item.setText(5, os.path.basename(s_asset))
+                item.setText(COL_ASSETS, os.path.basename(s_asset))
             
             p_id = orig.get('path_id', '')
             if p_id is not None and p_id != '':
-                item.setText(6, str(p_id))
+                item.setText(COL_PATHID, str(p_id))
 
             # Atlas column: packing geometry of the matched region ("-" for plain images)
             atlas_state = res.get('atlas_state')
@@ -2823,7 +2829,7 @@ class MainWindow(QMainWindow):
                                    ratio=(res.get('piece_stats') or {}).get('ratio'))
 
             # Right-align numeric columns (Original)
-            for col in [2, 3, 4, 6]:
+            for col in [COL_RES, COL_SIZE, COL_SIM, COL_PATHID]:
                 item.setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
             # Store the result object and its original index
@@ -2862,41 +2868,41 @@ class MainWindow(QMainWindow):
                     
                     # Exclusive Checkbox for candidate
                     is_this_match = (res.get('match_file') == cand['save_path'])
-                    c_item.setCheckState(0, Qt.CheckState.Checked if is_this_match else Qt.CheckState.Unchecked)
-                    c_item.setData(0, Qt.ItemDataRole.UserRole, is_this_match)
+                    c_item.setCheckState(COL_REPLACE, Qt.CheckState.Checked if is_this_match else Qt.CheckState.Unchecked)
+                    c_item.setData(COL_REPLACE, Qt.ItemDataRole.UserRole, is_this_match)
                     
-                    c_item.setText(1, cand.get('name', 'Unknown'))
-                    c_item.setText(2, f"{cand.get('width', 0)}x{cand.get('height', 0)}")
-                    c_item.setText(3, f"{cand.get('size', 0)/1024:.1f} KB")
-                    c_item.setText(4, f"{c_sim:.4f}")
+                    c_item.setText(COL_NAME, cand.get('name', 'Unknown'))
+                    c_item.setText(COL_RES, f"{cand.get('width', 0)}x{cand.get('height', 0)}")
+                    c_item.setText(COL_SIZE, f"{cand.get('size', 0)/1024:.1f} KB")
+                    c_item.setText(COL_SIM, f"{c_sim:.4f}")
                     self._apply_atlas_cell(c_item, cand.get('atlas_state'), cand.get('atlas_text'),
                                            cand.get('atlas_detail'), ratio=cand.get('atlas_ratio'))
 
                     # Right-align numeric columns (Candidate)
-                    for col in [2, 3, 4]:
+                    for col in [COL_RES, COL_SIZE, COL_SIM]:
                         c_item.setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
                     # Change: cand is already in a simplified format
                     c_item.setData(1, Qt.ItemDataRole.UserRole, cand)
 
-                    # Green highlighting for matching Name, Res, Size (columns 1, 2, 3)
+                    # Green highlighting for matching Name, Res, Size
                     green_brush = Qt.GlobalColor.green
                     if cand.get('name') == orig.get('name'):
-                        c_item.setBackground(1, green_brush)
+                        c_item.setBackground(COL_NAME, green_brush)
                     if cand.get('width') == orig.get('width') and cand.get('height') == orig.get('height'):
-                        c_item.setBackground(2, green_brush)
+                        c_item.setBackground(COL_RES, green_brush)
                     if cand.get('size') == orig.get('size'):
-                        c_item.setBackground(3, green_brush)
+                        c_item.setBackground(COL_SIZE, green_brush)
             
             all_top_items.append(item)
 
         self.tree.addTopLevelItems(all_top_items)
         self.tree.blockSignals(False)
         
-        # Dynamic Column Visibility for Assets/PathID (5, 6)
+        # Dynamic Column Visibility for Assets/PathID (Unity only)
         is_unity = (self.mode_combo.currentText() in ("Unity", "Unity APK"))
-        self.tree.setColumnHidden(5, not is_unity)
-        self.tree.setColumnHidden(6, not is_unity)
+        self.tree.setColumnHidden(COL_ASSETS, not is_unity)
+        self.tree.setColumnHidden(COL_PATHID, not is_unity)
         
         # Restore sort state
         self.tree.setSortingEnabled(True)
@@ -2929,10 +2935,10 @@ class MainWindow(QMainWindow):
             "none": QColor(150, 150, 150),
         }
         state = state or "none"
-        item.setText(10, text or "-")
-        item.setForeground(10, QBrush(colors.get(state, colors["none"])))
+        item.setText(COL_ATLAS, text or "-")
+        item.setForeground(COL_ATLAS, QBrush(colors.get(state, colors["none"])))
         # numeric value for sorting the column (the text is a percentage)
-        item.setData(10, Qt.ItemDataRole.UserRole, float(ratio) if ratio is not None else None)
+        item.setData(COL_ATLAS, Qt.ItemDataRole.UserRole, float(ratio) if ratio is not None else None)
         tip = detail or ""
         if state == "page":
             tip += "\n\nSimilarity = same pieces / all pieces of the page."
@@ -2941,17 +2947,17 @@ class MainWindow(QMainWindow):
         elif state in ("moved", "rotated"):
             tip += "\n\nPacking position/rotation does not affect the similarity, the regions are compared upright."
         if tip:
-            item.setToolTip(10, tip)
+            item.setToolTip(COL_ATLAS, tip)
 
     def _update_item_match_cols(self, item, match_tex, similarity):
         res_data = item.data(1, Qt.ItemDataRole.UserRole)
         orig = res_data['original']
         sim = similarity
         
-        item.setText(4, f"{sim:.4f}")
-        item.setText(7, os.path.basename(match_tex.get('save_path', 'Unknown')))
-        item.setText(8, f"{match_tex.get('width', 0)}x{match_tex.get('height', 0)}")
-        item.setText(9, f"{match_tex.get('size', 0)/1024:.1f} KB")
+        item.setText(COL_SIM, f"{sim:.4f}")
+        item.setText(COL_MATCH, os.path.basename(match_tex.get('save_path', 'Unknown')))
+        item.setText(COL_MRES, f"{match_tex.get('width', 0)}x{match_tex.get('height', 0)}")
+        item.setText(COL_MSIZE, f"{match_tex.get('size', 0)/1024:.1f} KB")
 
         # Atlas column: how the two builds packed this region (only for atlas items)
         atlas_state = match_tex.get('atlas_state')
@@ -2971,46 +2977,45 @@ class MainWindow(QMainWindow):
         self._apply_atlas_cell(item, atlas_state, atlas_text, atlas_detail,
                                ratio=(res_data.get('piece_stats') or {}).get('ratio'))
         if (orig.get('atlas') or {}).get('region'):
-            item.setToolTip(4, "Trim-normalised similarity (transparent borders ignored)\n"
+            item.setToolTip(COL_SIM, "Trim-normalised similarity (transparent borders ignored)\n"
                                f"matched by: {res_data.get('match_by', 'sim')}")
         elif orig.get('atlas_page'):
             stats = res_data.get('piece_stats') or {}
-            item.setToolTip(4, "Piece overlap: identical pieces / all pieces of the page\n"
+            item.setToolTip(COL_SIM, "Piece overlap: identical pieces / all pieces of the page\n"
                                f"{stats.get('identical', 0)} same, {stats.get('changed', 0)} changed "
                                f"of {stats.get('pieces', 0)}\n"
                                f"matched by: {res_data.get('match_by', 'sim')}")
 
         # Right-align numeric columns (Match update)
-        # 4: Similarity, 6: PathID, 8: M-Res, 9: M-Size
-        for col in [4, 6, 8, 9]:
+        for col in [COL_SIM, COL_PATHID, COL_MRES, COL_MSIZE]:
             item.setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         # Green highlighting for parent MATCH columns if matching ORIGINAL
         green_brush = Qt.GlobalColor.green
         
-        # Column 7 (Match Name) vs Column 1 (Original Name)
+        # Match Name vs Original Name
         m_name = match_tex.get('name', '')
         o_name = orig.get('name', '')
         if m_name and o_name and m_name == o_name:
-            item.setBackground(7, green_brush)
+            item.setBackground(COL_MATCH, green_brush)
         else:
-            item.setBackground(7, Qt.GlobalColor.transparent)
+            item.setBackground(COL_MATCH, Qt.GlobalColor.transparent)
         
-        # Column 8 (M-Res) vs Column 2 (Original Res)
+        # M-Res vs Original Res
         m_w, m_h = match_tex.get('width', 0), match_tex.get('height', 0)
         o_w, o_h = orig.get('width', 0), orig.get('height', 0)
         if m_w == o_w and m_h == o_h and m_w > 0:
-            item.setBackground(8, green_brush)
+            item.setBackground(COL_MRES, green_brush)
         else:
-            item.setBackground(8, Qt.GlobalColor.transparent)
+            item.setBackground(COL_MRES, Qt.GlobalColor.transparent)
             
-        # Column 9 (M-Size) vs Column 3 (Original Size)
+        # M-Size vs Original Size
         m_size = match_tex.get('size', 0)
         o_size = orig.get('size', 0)
         if m_size == o_size and m_size > 0:
-            item.setBackground(7, green_brush)
+            item.setBackground(COL_MSIZE, green_brush)
         else:
-            item.setData(7, Qt.ItemDataRole.BackgroundRole, None)
+            item.setData(COL_MSIZE, Qt.ItemDataRole.BackgroundRole, None)
 
     def update_copy_button_state(self):
         any_checked = any(r.get('replace', False) for r in self.results)

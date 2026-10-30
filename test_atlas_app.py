@@ -323,14 +323,18 @@ def test_page_mode():
             window.results = results
             window.update_tree(show_progress=False)
             top = window.tree.topLevelItem(0)
-            check("page ui: Atlas cell shows the overlap", "% (" in top.text(10), top.text(10))
+            check("page ui: Atlas column sits next to Similarity",
+                  window.tree.headerItem().text(4) == "Similarity"
+                  and window.tree.headerItem().text(5) == "Atlas",
+                  (window.tree.headerItem().text(4), window.tree.headerItem().text(5)))
+            check("page ui: Atlas cell shows the overlap", "% (" in top.text(5), top.text(5))
             check("page ui: Similarity tooltip explains the metric",
                   "Piece overlap" in top.toolTip(4), top.toolTip(4)[:60])
             check("page ui: Atlas tooltip explains the ratio",
-                  "same pieces" in top.toolTip(10), top.toolTip(10)[:80])
+                  "same pieces" in top.toolTip(5), top.toolTip(5)[:80])
             # the Atlas column must sort numerically, not alphabetically
-            window.tree.sortItems(10, Qt.SortOrder.DescendingOrder)
-            ratios = [window.tree.topLevelItem(i).data(10, Qt.ItemDataRole.UserRole)
+            window.tree.sortItems(5, Qt.SortOrder.DescendingOrder)
+            ratios = [window.tree.topLevelItem(i).data(5, Qt.ItemDataRole.UserRole)
                       for i in range(window.tree.topLevelItemCount())]
             numeric = [r for r in ratios if isinstance(r, (int, float))]
             check("page ui: Atlas column sorts by the numeric ratio",
