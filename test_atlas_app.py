@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -491,12 +492,75 @@ def test_match_fallback_scan():
         remove_tree(root)
 
 
+def test_preview_rebuild():
+    """Missing previews (Clear temp) are rebuilt and the right panel works again."""
+    root = tempfile.mkdtemp(prefix="atlas_rebuild_", dir=os.path.dirname(PROJECT))
+    cwd = os.getcwd()
+    try:
+        orig_dir, mod_dir = prepare_pair(root)
+        if not orig_dir or not mod_dir:
+            print("  SKIP  game folders from config.ini not available")
+            return
+        os.chdir(root)
+        temp_orig = os.path.join(root, "t_orig")
+        temp_mod = os.path.join(root, "t_mod")
+        orig_items = []
+        mod_items = []
+        for atlas_name in ATLASES:
+            orig_items += atlas_mod.extract_atlas_pages(os.path.join(orig_dir, atlas_name),
+                                                        os.path.join(temp_orig, "atlas"))
+            mod_items += atlas_mod.extract_atlas_pages(os.path.join(mod_dir, atlas_name),
+                                                       os.path.join(temp_mod, "atlas"))
+        print(f"  info  extracted {len(orig_items)} / {len(mod_items)} page items: "
+              f"{[t['name'] for t in orig_items]}")
+
+        # simulate "Clear temp Folders": every preview file disappears
+        for item in orig_items + mod_items:
+            if os.path.exists(item["save_path"]):
+                os.remove(item["save_path"])
+        check("rebuild: previews are gone",
+              all(not os.path.exists(t["save_path"]) for t in orig_items + mod_items))
+
+        window = app_main.MainWindow()
+        window.temp_dir_orig = temp_orig
+        window.temp_dir_mod = temp_mod
+        window.orig_path.setText(orig_dir)
+        window.mod_path.setText(mod_dir)
+        window.orig_textures = orig_items
+        window.mod_textures = mod_items
+        window.match()
+
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            APP.processEvents()
+            if window.worker_thread is None and window.results:
+                break
+            time.sleep(0.1)
+
+        check("rebuild: previews were rebuilt",
+              all(os.path.exists(t["save_path"]) for t in orig_items + mod_items),
+              [t["name"] for t in orig_items if not os.path.exists(t["save_path"])])
+        check("rebuild: match produced results", bool(window.results), len(window.results))
+        four = next((r for r in window.results if r["original"]["name"].startswith("10p")), None)
+        check("rebuild: 10p row kept its atlas info",
+              bool(four and "% (" in (four.get("atlas_text") or "")),
+              None if four is None else four.get("atlas_text"))
+        check("rebuild: row names are the page stems",
+              all("__" not in r["original"]["name"] for r in window.results),
+              [r["original"]["name"] for r in window.results][:5])
+        window.close()
+    finally:
+        os.chdir(cwd)
+        remove_tree(root)
+
+
 def main():
     test_legacy_region_apply()
     test_page_mode()
     test_atlas_disabled()
     test_stale_metadata()
     test_match_fallback_scan()
+    test_preview_rebuild()
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")
     if FAILURES:

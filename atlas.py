@@ -656,12 +656,14 @@ def extract_atlas_regions(atlas_path: str, out_dir: str, log_callback=None) -> L
 
 
 def extract_atlas_pages(atlas_path: str, out_dir: str, preview_max: int = 1024,
-                        log_callback=None) -> List[dict]:
+                        log_callback=None, used_names: Optional[set] = None) -> List[dict]:
     """One metadata entry per atlas page (no per-piece files).
 
     The page is offered as a single item, and the pieces are compared internally through
     their digests: `similarity = identical pieces / total pieces`, computed by
-    compare_piece_digests() without decoding the pages again.
+    compare_piece_digests() without decoding the pages again. The item name is the page
+    stem ("3p", "3p_2"), falling back to "<atlas>__<page>" when the folder already has a page
+    with that name so two atlases cannot produce ambiguous rows.
     """
     def log(message):
         if log_callback:
@@ -694,7 +696,11 @@ def extract_atlas_pages(atlas_path: str, out_dir: str, preview_max: int = 1024,
             preview.thumbnail((preview_max, preview_max), Image.Resampling.BOX)
         page_stem = os.path.splitext(os.path.basename(page.name))[0]
         safe_stem = re.sub(r'[\\/:*?"<>|]', "_", page_stem).strip() or "page"
-        name = stem if len(atlas.pages) == 1 else f"{stem}__{safe_stem}"
+        if used_names is None:
+            name = safe_stem
+        else:
+            name = safe_stem if safe_stem.lower() not in used_names else f"{stem}__{safe_stem}"
+            used_names.add(name.lower())
         file_name = f"{re.sub(r'[\\/:*?\"<>|]', '_', name)}.png"
         save_path = os.path.join(out_dir, file_name)
         try:

@@ -881,12 +881,14 @@ class WorkerThread(QThread):
 
         atlas_enabled = bool(self.args.get('atlas_enabled', True))
         atlas_files = atlas_mod.find_atlas_files(folder) if atlas_enabled else []
+        used_names = set()
         for atlas_path in atlas_files:
             atlas = atlas_mod.parse_atlas(atlas_path)
             if not atlas.pages:
                 continue
             out_dir = os.path.join(temp_path, "atlas", os.path.splitext(os.path.basename(atlas_path))[0])
-            entries = atlas_mod.extract_atlas_pages(atlas_path, out_dir, log_callback=self.sig_log.emit)
+            entries = atlas_mod.extract_atlas_pages(atlas_path, out_dir, log_callback=self.sig_log.emit,
+                                                   used_names=used_names)
             if entries:
                 self.sig_log.emit(f"Atlas {os.path.basename(atlas_path)}: {len(entries)} page item(s) -> {label}")
             for page in atlas.pages:
@@ -1628,6 +1630,33 @@ class MainWindow(QMainWindow):
                 self.mod_path.setText(resolved_path)
                 self.log(f"Overwrote Modified Path: {resolved_path}")
 
+    def _rebuild_atlas_preview(self, texture, temp_path):
+        """Regenerates the preview PNG of an atlas page item (e.g. after Clear temp)."""
+        meta = texture.get('atlas_page') or {}
+        page_file = meta.get('page_file') or ''
+        if not page_file or not os.path.exists(page_file):
+            return None
+        page_image = atlas_mod.load_page_image(page_file)
+        if page_image is None:
+            return None
+        # refresh the piece data too when the metadata came from an older version
+        if not meta.get('digests'):
+            regions = atlas_page_regions(meta)
+            if regions:
+                meta['digests'] = atlas_mod.page_piece_digests(page_image, regions)
+        atlas_stem = os.path.splitext(os.path.basename(meta.get('atlas_file') or 'atlas'))[0]
+        out_dir = os.path.join(temp_path, "atlas", atlas_stem)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            preview = page_image.copy()
+            if max(preview.size) > 1024:
+                preview.thumbnail((1024, 1024), Image.Resampling.BOX)
+            path = os.path.join(out_dir, f"{texture.get('name', 'page')}.png")
+            preview.save(path, format="PNG")
+            return path
+        except Exception:
+            return None
+
     def _normalize_textures(self, textures, temp_path):
         """Ensures all textures have required fields like 'save_path' and 'size'."""
         if not textures: return
@@ -1640,6 +1669,14 @@ class MainWindow(QMainWindow):
                 elif 'name' in t and 'path_id' in t:
                     # Specific to our safe_name pattern for Unity extractions
                     t['save_path'] = os.path.join(temp_path, f"{t['name']}_{t['path_id']}.png")
+            
+            # 1b. A missing preview (cleared temp folder) is rebuilt from the atlas page,
+            #     so Match does not silently skip every item.
+            if t.get('save_path') and not os.path.exists(t['save_path']) and t.get('atlas_page'):
+                rebuilt = self._rebuild_atlas_preview(t, temp_path)
+                if rebuilt:
+                    t['save_path'] = rebuilt
+                    self.log(f"Rebuilt preview for {t.get('name')}: {os.path.basename(rebuilt)}")
             
             if 'save_path' in t:
                 changed = True
@@ -2614,6 +2651,25 @@ class MainWindow(QMainWindow):
         self._normalize_textures(self.orig_textures, self.temp_dir_orig)
         self._normalize_textures(self.mod_textures, self.temp_dir_mod)
 
+        # Drop items whose preview/file is gone (cleared temp, moved folder) instead of
+        # matching nothing; if everything vanished, scan the folders again below.
+        before_counts = (len(self.orig_textures), len(self.mod_textures))
+        self.orig_textures = [t for t in self.orig_textures
+                              if t.get('save_path') and os.path.exists(t['save_path'])]
+        self.mod_textures = [t for t in self.mod_textures
+                             if t.get('save_path') and os.path.exists(t['save_path'])]
+        if (len(self.orig_textures), len(self.mod_textures)) != before_counts:
+            self.log(f"Dropped items with missing previews: "
+                     f"original {before_counts[0] - len(self.orig_textures)}, "
+                     f"modified {before_counts[1] - len(self.mod_textures)}.")
+
+        if not self.orig_textures:
+            self.orig_textures = self.scan_image_folder(self.orig_path.text(), self.temp_dir_orig)
+            self._normalize_textures(self.orig_textures, self.temp_dir_orig)
+        if not self.mod_textures:
+            self.mod_textures = self.scan_image_folder(self.mod_path.text(), self.temp_dir_mod)
+            self._normalize_textures(self.mod_textures, self.temp_dir_mod)
+
         self.progress_bar.setValue(0)
         self.progress_label.setText("Matching...")
         
@@ -2640,13 +2696,15 @@ class MainWindow(QMainWindow):
         page_paths = set()
         if hasattr(self, "chk_atlas") and self.chk_atlas.isChecked() and temp_path:
             atlas_files = atlas_mod.find_atlas_files(folder)
+            used_names = set()
             for atlas_path in atlas_files:
                 atlas = atlas_mod.parse_atlas(atlas_path)
                 if not atlas.pages:
                     continue
                 out_dir = os.path.join(temp_path, "atlas",
                                        os.path.splitext(os.path.basename(atlas_path))[0])
-                entries = atlas_mod.extract_atlas_pages(atlas_path, out_dir, log_callback=self.log)
+                entries = atlas_mod.extract_atlas_pages(atlas_path, out_dir, log_callback=self.log,
+                                                        used_names=used_names)
                 textures.extend(entries)
                 for page in atlas.pages:
                     page_paths.add(os.path.normcase(os.path.abspath(atlas.page_path(page))))
