@@ -442,11 +442,47 @@ def test_stale_metadata():
         remove_tree(root)
 
 
+def test_match_fallback_scan():
+    """Match without extraction (e.g. right after Clear temp) must still use atlas pages."""
+    root = tempfile.mkdtemp(prefix="atlas_fallback_", dir=os.path.dirname(PROJECT))
+    cwd = os.getcwd()
+    try:
+        orig_dir, mod_dir = prepare_pair(root)
+        if not orig_dir or not mod_dir:
+            print("  SKIP  game folders from config.ini not available")
+            return
+        temp_dir = os.path.join(root, "temp")
+        os.makedirs(temp_dir, exist_ok=True)
+        os.chdir(root)
+
+        window = app_main.MainWindow()
+        items = window.scan_image_folder(orig_dir, temp_dir)
+        pages = [t for t in items if t.get("atlas_page")]
+        print(f"  info  fallback scan: {len(items)} items, {len(pages)} atlas page(s) "
+              f"-> {[t['name'] for t in pages]}")
+        check("fallback: atlas pages are expanded into page items", bool(pages), len(pages))
+        check("fallback: page items carry piece digests",
+              all(p["atlas_page"].get("digests") for p in pages))
+        check("fallback: sheet PNGs are not offered as plain images",
+              all(not (t["name"] == "10p" and not t.get("atlas_page")) for t in items),
+              [t["name"] for t in items if t["name"] == "10p"])
+        ten = next((t for t in pages if t["name"] == "10p"), None)
+        check("fallback: 10p is offered as an atlas page", ten is not None,
+              [t["name"] for t in pages])
+        check("fallback: page item points at the real page file",
+              bool(ten and ten["atlas_page"].get("page_file")))
+        window.close()
+    finally:
+        os.chdir(cwd)
+        remove_tree(root)
+
+
 def main():
     test_legacy_region_apply()
     test_page_mode()
     test_atlas_disabled()
     test_stale_metadata()
+    test_match_fallback_scan()
 
     print(f"\n{CHECKS - len(FAILURES)}/{CHECKS} checks passed")
     if FAILURES:

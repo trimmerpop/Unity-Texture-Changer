@@ -2552,7 +2552,7 @@ class MainWindow(QMainWindow):
                 if self.mode_combo.currentText() == "Unity APK":
                     apk_dir = os.path.join(self.temp_dir_orig, "apk_contents")
                     if os.path.exists(apk_dir): orig_path = apk_dir
-                self.orig_textures = self.scan_image_folder(orig_path)
+                self.orig_textures = self.scan_image_folder(orig_path, self.temp_dir_orig)
             
             # Save these paths to config.ini so restore_matching_results recognizes them on next start
             settings = QSettings("config.ini", QSettings.Format.IniFormat)
@@ -2580,7 +2580,7 @@ class MainWindow(QMainWindow):
                 if self.mode_combo.currentText() == "Unity APK":
                     apk_dir = os.path.join(self.temp_dir_mod, "apk_contents")
                     if os.path.exists(apk_dir): mod_path = apk_dir
-                self.mod_textures = self.scan_image_folder(mod_path)
+                self.mod_textures = self.scan_image_folder(mod_path, self.temp_dir_mod)
             
         if not self.orig_textures or not self.mod_textures:
             msg = "Extraction metadata missing. Please Extract first."
@@ -2602,15 +2602,41 @@ class MainWindow(QMainWindow):
                           filter_enabled=self.chk_sim_filter.isChecked(),
                           sim_cutoff=float(self.txt_sim_cutoff.text()))
 
-    def scan_image_folder(self, folder):
+    def scan_image_folder(self, folder, temp_path=None):
+        """Direct folder scan used when no extraction metadata is available.
+
+        With atlas handling enabled the .atlas pages are expanded into page items; otherwise
+        Match would list the raw sheet PNGs, which carry no atlas information and would leave
+        the Atlas column empty.
+        """
         textures = []
-        if not os.path.exists(folder): return textures
+        if not folder or not os.path.exists(folder):
+            return textures
         folder = os.path.normpath(folder)
         self.log(f"Scanning images in {folder} (including all subfolders)...")
+
+        page_paths = set()
+        if hasattr(self, "chk_atlas") and self.chk_atlas.isChecked() and temp_path:
+            atlas_files = atlas_mod.find_atlas_files(folder)
+            for atlas_path in atlas_files:
+                atlas = atlas_mod.parse_atlas(atlas_path)
+                if not atlas.pages:
+                    continue
+                out_dir = os.path.join(temp_path, "atlas",
+                                       os.path.splitext(os.path.basename(atlas_path))[0])
+                entries = atlas_mod.extract_atlas_pages(atlas_path, out_dir, log_callback=self.log)
+                textures.extend(entries)
+                for page in atlas.pages:
+                    page_paths.add(os.path.normcase(os.path.abspath(atlas.page_path(page))))
+            if textures:
+                self.log(f"Atlas pages found: {len(textures)} item(s) (pieces compared per page)")
+
         for root, dirs, fnames in os.walk(folder):
             for f in fnames:
                 if f.lower().endswith(SUPPORTED_IMAGE_EXTS):
                     path = os.path.join(root, f)
+                    if os.path.normcase(os.path.abspath(path)) in page_paths:
+                        continue  # atlas page sheet, already offered as a page item
                     try:
                         img = Image.open(path)
                         name = os.path.splitext(f)[0]
