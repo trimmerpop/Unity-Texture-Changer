@@ -333,9 +333,12 @@ def assemble_atlas_preview(orig_meta, mod_meta, out_dir, orig_preview_path=None,
 
     orig_digests = orig_meta.get('digests') or {}
     mod_digests = mod_meta.get('digests') or {}
+    # without digests (e.g. page data rebuilt from the .atlas file) every piece is
+    # composited; identical art produces identical pixels anyway
+    have_digests = bool(orig_digests) and bool(mod_digests)
     changed = sum(1 for key, digest in orig_digests.items()
                   if mod_digests.get(key) is not None and mod_digests[key] != digest)
-    if not changed:
+    if have_digests and not changed:
         # Nothing to change: the assembled result IS the original page, so show that instead
         # of the re-packed mod sheet (no misleading diff noise on an unchanged page).
         try:
@@ -3684,6 +3687,31 @@ class MainWindow(QMainWindow):
         self.comp_widget.current_img1_path = path1
         self.comp_widget.current_img2_path = path2
 
+    def _mod_page_meta(self, match_tex):
+        """Atlas page metadata of a matched texture.
+
+        The candidates stored in a result only carry the basics (path/name/size/...), so the
+        page metadata (rects, digests, pma) is looked up in the modified texture pool by path.
+        """
+        meta = (match_tex or {}).get('atlas_page') or {}
+        if meta:
+            return meta
+        path = (match_tex or {}).get('save_path') or ''
+        if not path:
+            return {}
+        target = os.path.normcase(os.path.abspath(path))
+        base_name = os.path.basename(path).lower()
+        fallback = None
+        for tex in (self.mod_textures or []):
+            save_path = tex.get('save_path') or ''
+            if not save_path:
+                continue
+            if os.path.normcase(os.path.abspath(save_path)) == target:
+                return tex.get('atlas_page') or {}
+            if fallback is None and os.path.basename(save_path).lower() == base_name:
+                fallback = tex.get('atlas_page') or {}
+        return fallback or {}
+
     def update_comparison_view(self, orig_tex, match_tex):
         if not orig_tex: return
         path1 = orig_tex['save_path']
@@ -3696,7 +3724,10 @@ class MainWindow(QMainWindow):
         # the re-packed sheet, so the yellow highlight marks the real art changes.
         self._atlas_preview = None
         orig_page = orig_tex.get('atlas_page') or {}
-        mod_page = (match_tex or {}).get('atlas_page') or {}
+        mod_page = self._mod_page_meta(match_tex)
+        if orig_page and not mod_page and match_tex:
+            self.log(f"No atlas page data for the match ({match_tex.get('name', '?')}); "
+                     f"comparing the mod image as it is.")
         if orig_page and mod_page:
             same_atlas = (os.path.basename(orig_page.get('atlas_file') or '').lower()
                           == os.path.basename(mod_page.get('atlas_file') or '').lower())

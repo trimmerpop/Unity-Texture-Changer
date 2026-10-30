@@ -452,6 +452,30 @@ def test_page_mode():
             check("highlight: assembling removes the re-packing diff noise",
                   asm_diff < raw_diff * 0.5, (raw_diff, asm_diff))
 
+            # ---- the real UI passes a candidate summary (no atlas_page data) ----
+            # the page metadata has to come from the modified texture pool by path
+            candidate = next((c for c in (target.get("candidates") or [])
+                              if c.get("save_path") == target.get("match_file")), None)
+            if candidate is None:
+                check("highlight: candidate row found", False, target.get("match_file"))
+            else:
+                window.mod_textures = mod_items
+                window.diff_check.setChecked(True)
+                window.update_comparison_view(target["original"], candidate)
+                deadline = time.time() + 120
+                while time.time() < deadline:
+                    APP.processEvents()
+                    current = window.comp_widget.current_img2_path or ""
+                    if current.endswith("__assembled.png"):
+                        break
+                    time.sleep(0.05)
+                check("highlight: a candidate selection is assembled too",
+                      (window.comp_widget.current_img2_path or "").endswith("__assembled.png"),
+                      window.comp_widget.current_img2_path)
+                check("highlight: mod page data is found for a candidate",
+                      bool(window._mod_page_meta(candidate).get("page_file")),
+                      list(window._mod_page_meta(candidate).keys()))
+
             # ---- highlight OFF: the mod image itself must be compared, no assembly ----
             window.diff_check.setChecked(False)
             window.update_comparison_view(target["original"], mod_match)
